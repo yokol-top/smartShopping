@@ -1,0 +1,37 @@
+# MCP服务器配置
+# 可以根据需要启用/禁用不同的MCP服务
+
+servers:
+  # 订单服务
+  - name: "order"
+    enabled: true
+    endpoint: "http://localhost:8000/sse"
+    description: "用户的创建、修改；操作用户的银行卡和地址等；操作订单"
+  # 示例: 天气服务
+  - name: "weather"
+    enabled: false
+    endpoint: "http://localhost:8001/mcp"
+    description: "获取天气信息"
+  
+  # 示例: 文件操作服务
+  - name: "file_operations"
+    enabled: false
+    endpoint: "http://localhost:8002/mcp"
+    description: "文件读写操作"
+  
+  # 示例: 计算器服务
+  - name: "calculator"
+    enabled: false
+    endpoint: "http://localhost:8003/mcp"
+    description: "数学计算"
+  
+  # 示例: 网络搜索服务
+  - name: "web_search"
+    enabled: false
+    endpoint: "http://localhost:8004/mcp"
+    description: "网络搜索"
+
+# 注意:
+# 1. 工具列表会自动从MCP服务器动态获取，无需在配置中手动列出
+# 2. 实际使用时需要根据你的MCP服务器进行配置
+# 3. 你可以添加更多的MCP服务器

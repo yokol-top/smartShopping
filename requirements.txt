@@ -1,0 +1,33 @@
+chromadb>=0.4.22
+langchain>=0.1.0
+langchain-community>=0.0.20
+ollama>=0.1.6
+openai>=1.12.0
+pyyaml>=6.0
+rank-bm25>=0.2.2
+sentence-transformers>=2.3.1
+numpy>=1.24.0
+sqlalchemy>=2.0.0
+requests>=2.31.0
+python-dotenv>=1.0.0
+colorlog>=6.8.0
+
+# Document processing dependencies
+pypdf>=3.17.0
+pdfplumber>=0.10.0
+python-docx>=1.1.0
+python-pptx>=0.6.23
+openpyxl>=3.1.2
+unstructured>=0.12.0
+markdown>=3.5
+lxml>=5.0.0
+
+# Web frontend
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+
+# OpenTelemetry - Agent observability
+opentelemetry-api>=1.20.0
+opentelemetry-sdk>=1.20.0
+opentelemetry-exporter-otlp>=1.20.0
+opentelemetry-semantic-conventions>=0.50b0

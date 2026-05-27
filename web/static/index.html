@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SmartAgent</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <!-- ==================== 登录页 ==================== -->
+    <div id="login-page" class="page">
+        <div class="login-card">
+            <div class="login-header">
+                <div class="logo">🤖</div>
+                <h1>SmartAgent</h1>
+                <p class="subtitle">智能AI助手</p>
+            </div>
+            <form id="login-form" onsubmit="return false;">
+                <div class="form-group">
+                    <label>用户名</label>
+                    <input type="text" id="username" placeholder="请输入用户名" autocomplete="username" required>
+                </div>
+                <div class="form-group">
+                    <label>密码</label>
+                    <input type="password" id="password" placeholder="请输入密码" autocomplete="current-password" required>
+                </div>
+                <button type="submit" id="login-btn" class="btn-primary" onclick="doLogin()">登 录</button>
+                <p id="login-error" class="error-msg"></p>
+            </form>
+        </div>
+    </div>
+
+    <!-- ==================== 主界面 ==================== -->
+    <div id="main-page" class="page" style="display:none;">
+        <!-- 侧边栏 -->
+        <aside id="sidebar">
+            <div class="sidebar-header">
+                <span class="logo-sm">🤖</span>
+                <span class="app-name">SmartAgent</span>
+                <button class="btn-icon" onclick="toggleSidebar()" title="收起侧边栏">✕</button>
+            </div>
+
+            <button class="btn-new-chat" onclick="newSession()">＋ 新建对话</button>
+
+            <div class="session-list" id="session-list">
+                <!-- 动态渲染 -->
+            </div>
+
+            <div class="sidebar-footer">
+                <div class="user-info">
+                    <span class="user-avatar">👤</span>
+                    <span id="display-username">用户</span>
+                </div>
+                <button class="btn-icon btn-sm" onclick="doLogout()" title="退出登录">↩</button>
+            </div>
+        </aside>
+
+        <!-- 聊天区域 -->
+        <main id="chat-area">
+            <header class="chat-header">
+                <button class="btn-icon sidebar-toggle" onclick="toggleSidebar()">☰</button>
+                <h2 id="chat-title">新对话</h2>
+                <div class="header-actions">
+                    <button class="btn-icon" onclick="showToolsPanel()" title="工具列表">🛠</button>
+                </div>
+            </header>
+
+            <div class="messages" id="messages">
+                <div class="welcome-msg">
+                    <div class="welcome-icon">🤖</div>
+                    <h3>你好！我是 SmartAgent</h3>
+                    <p>我可以回答问题、检索知识库、调用工具完成任务。试试问我些什么吧！</p>
+                </div>
+            </div>
+
+            <div class="input-area">
+                <div class="input-wrapper">
+                    <textarea id="msg-input" placeholder="输入消息... (Enter 发送, Shift+Enter 换行)"
+                              rows="1" onkeydown="handleInputKey(event)"></textarea>
+                    <button class="btn-send" id="send-btn" onclick="sendMessage()">
+                        <span class="send-icon">➤</span>
+                    </button>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <!-- ==================== 工具面板弹窗 ==================== -->
+    <div id="tools-modal" class="modal" style="display:none;">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>🛠 已注册工具</h3>
+                <button class="btn-icon" onclick="closeToolsPanel()">✕</button>
+            </div>
+            <div class="modal-body" id="tools-list">
+                <!-- 动态渲染 -->
+            </div>
+            <div class="modal-footer" id="rate-limit-info"></div>
+        </div>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>

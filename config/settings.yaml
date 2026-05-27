@@ -1,0 +1,316 @@
+# Agent配置文件
+# LLM配置 (统一使用OpenAI API接口，支持Ollama/OpenAI/其他兼容服务)
+llm:
+  # 提供商类型: "ollama"使用本地Ollama, "openai"使用OpenAI服务
+  provider: "ollama"
+  
+  # API密钥 (Ollama使用"EMPTY"，OpenAI需要真实密钥)
+  api_key: "api_key"
+
+  # API基础URL
+  # - Ollama: "http://localhost:11434/v1"
+  # - OpenAI: "https://api.openai.com/v1"
+  # - 其他兼容服务: 根据服务商提供的URL
+#  base_url: "http://localhost:11434/v1"
+  base_url: "http://localhost:3003/v1"
+
+  # 模型名称
+  # - Ollama: "qwen2.5:latest", "qwen2.5:7b", 等
+  # - OpenAI: "gpt-4", "gpt-3.5-turbo", 等
+#  model: "hf.co/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:UD-Q4_K_XL"
+  model: "claude-sonnet-4.6"
+
+  temperature: 0.7
+  max_tokens: 5000
+  timeout: 120
+
+# 向量数据库配置 (Chroma)
+vectordb:
+  type: "chroma"
+  persist_directory: "./data/chroma_db"
+  collection_name: "knowledge_base"
+
+# 嵌入模型配置 (支持 local、ollama、openai)
+embedding:
+  # 提供商类型: "local"（本地模型）, "ollama" 或 "openai"
+  provider: "local"
+  
+  # API密钥（本地模型不需要）
+  api_key: "EMPTY"
+  
+  # API基础URL（本地模型不需要）
+  base_url: null
+  
+  # 模型名称或本地路径
+  # - Local: "../../rag_app/bge-small-zh-v1.5" (本地 Sentence Transformers 模型路径)
+  # - Ollama: "nomic-embed-text", "mxbai-embed-large"
+  # - OpenAI: "text-embedding-3-small", "text-embedding-3-large"
+  model: "../model/bge-small-zh-v1.5"
+  # bge-small-zh-v1.5支持的维度数最大是512，不同的模型维度不同
+  dimension: 512
+
+# 记忆配置
+memory:
+  short_term:
+    max_messages: 5  # 短期记忆保留的最大消息数
+    rolling_summary:
+      enabled: true  # 启用滚动总结机制
+      trigger_count: 5  # 每N条新消息触发一次滚动总结
+      min_messages_for_summary: 4  # 触发总结所需的最小消息数
+      summary_ratio: 0.5  # 总结消息的比例（0.5表示总结前一半的消息）
+    response_summary:
+      enabled: true  # 启用响应摘要功能（自动提取长响应的关键信息）
+      max_length: 300  # 响应长度阈值（超过此长度将提取关键信息）
+  long_term:
+    enabled: true
+    summary_threshold: 10  # 每n轮对话进行一次总结
+    persist_directory: "./data/long_term_memory"  # Chroma持久化目录
+
+# 意图识别配置
+intent:
+  complexity:
+    medium_step_threshold: 4   # 中等复杂度阈值：单意图4-7步 / ≤3意图4-7步
+    complex_step_threshold: 7  # 复杂任务阈值：超过7步或多阶段流程
+
+# 任务评估配置
+evaluator:
+  pre_evaluation: false       # 执行前评估
+  mid_evaluation: true       # 执行中评估（每步骤后）
+  post_evaluation: false      # 执行后评估
+
+# 任务规划配置
+planner:
+  max_replan_attempts: 2     # 最大重新规划次数（评估不通过时重试）
+
+# ReAct Agent配置
+react:
+  enabled: true  # 启用ReAct模式处理复杂任务
+  max_iterations: 10  # 最大思考-行动循环次数
+  temperature: 0.3  # ReAct推理的温度参数（较低以提高准确性）
+
+# RAG配置
+rag:
+  # 查询重写
+  query_rewrite:
+    enabled: true
+    max_rewrites: 3
+  
+  # 多查询生成
+  multi_query:
+    enabled: true
+    num_queries: 3
+  
+  # HyDE (Hypothetical Document Embeddings)
+  hyde:
+    enabled: true
+  
+  # 混合检索 (向量+BM25)
+  hybrid_search:
+    enabled: true
+    vector_weight: 0.7
+    bm25_weight: 0.3
+  
+  # 重排序
+  rerank:
+    enabled: true
+    top_k: 10  # 初始检索数量
+    final_k: 5  # 重排序后保留数量
+  
+  # 父子分块
+  parent_child_chunking:
+    enabled: true
+    parent_chunk_size: 1000
+    child_chunk_size: 200
+    chunk_overlap: 50
+  
+  # Self-fix (自我修正)
+  self_fix:
+    enabled: true
+    max_iterations: 2
+
+# 查询路由配置
+router:
+  # 简单问候语关键词
+  greeting_keywords:
+    - "你好"
+    - "hi"
+    - "hello"
+    - "嗨"
+    - "早上好"
+    - "晚上好"
+
+  # 复杂度阈值（简单查询字符数阈值）
+  complexity_threshold: 5
+
+# 上下文窗口工程配置
+context_window:
+  # 总预算（字符数），超出后启动全局压缩
+  total_budget: 12000
+  
+  # 各分区独立预算（字符数）
+  section_budgets:
+    system_prompt: 2000       # 系统提示词（优先级最高）
+    planning_steps: 1500      # 规划步骤
+    tools: 2000               # 工具列表（懒加载：选择阶段仅名称+描述）
+    short_term_memory: 2000   # 短期记忆（最近对话）
+    rag_results: 2000         # RAG检索结果
+    long_term_memory: 1000    # 长期记忆
+    tool_results: 2000        # 工具执行结果（优先级最低，最先裁剪）
+  
+  # 裁剪配置：保留最近N轮工具执行结果，更早的仅保留描述行
+  trim_tool_results_after_rounds: 5
+  
+  # 投影配置：超过此阈值的内容会被投影到文件
+  projection_threshold: 3000
+  projection_dir: "./data/context_projections"
+
+# 子Agent配置
+sub_agents:
+  enabled: true                    # 是否启用子Agent路由
+  presale:
+    init_product_kb: true          # 启动时是否自动初始化商品FAQ知识库
+  functional: {}                   # 功能处理子Agent（暂无额外配置）
+
+  # 子Agent上下文预算（字符数）
+  # 子Agent不需要主Agent那么大的上下文窗口，精简后更高效
+  context_budgets:
+    presale:
+      total: 4000                  # 售前子Agent总预算
+      task_brief: 500              # P1: 任务摘要（不可裁剪）
+      user_profile: 300            # P2: 用户画像
+      conv_context: 1200           # P3: 对话上下文（最近3轮）
+      domain_context: 1500         # P4: RAG/MCP领域数据
+      main_replies: 500            # P5: 主Agent补充信息
+    functional:
+      total: 4000                  # 功能子Agent总预算
+      task_brief: 500              # P1: 任务摘要
+      user_profile: 300            # P2: 用户画像
+      conv_context: 800            # P3: 对话上下文（功能操作不太依赖历史）
+      domain_context: 1800         # P4: 工具列表+参数schema
+      main_replies: 600            # P5: 主Agent补充（参数补全需要更多空间）
+
+# MCP服务配置
+mcp:
+  enabled: true
+  config_file: "./config/mcp_servers.yaml"
+  timeout: 30
+
+# 系统提示词配置
+system_prompt:
+  enabled: true
+  content: |
+    你是一个智能AI助手，具备以下核心能力：
+    
+    1. **知识检索与问答**
+       - 可以从知识库中检索相关信息来回答问题
+       - 支持复杂查询的深度分析和多文档综合
+       - 在信息不足时会明确告知用户
+    
+    2. **工具调用能力**
+       - 可以调用外部工具和服务来完成实际操作
+       - 能够自动识别用户意图并选择合适的工具
+       - 支持用户管理、订单处理等实际业务操作
+    
+    3. **对话管理**
+       - 理解并记住对话上下文，支持多轮对话
+       - 会定期总结重要信息形成长期记忆
+       - 能够根据对话历史提供连贯的回复
+    
+    **交互原则：**
+    - 回答要准确、简洁、有条理
+    - 不确定时明确表达，不编造信息
+    - 区分知识库信息和通用知识，并注明来源
+    - 执行操作前会确认关键参数
+    - 保持友好、专业的沟通风格
+    
+    **当前会话上下文：**
+    你正在与用户进行多轮对话。请根据对话历史和用户的最新输入，提供最合适的回复。
+
+# 可观测性配置 (OpenTelemetry)
+observability:
+  enabled: true
+  service_name: "smart-agent"
+  exporter: "otlp"              # console / otlp / both / none
+  otlp_endpoint: "http://localhost:4317"  # Jaeger/Grafana Tempo OTLP 端点
+  trace_llm_content: true          # 是否记录 prompt/response 内容（生产环境建议关闭）
+  max_attribute_length: 10000        # Span 属性最大长度（截断保护）
+
+# 目标理解层配置
+goal_understanding:
+  clarification_threshold: 0.6    # 低于此置信度时触发澄清机制
+  use_memory_reasoning: true       # 是否使用长期记忆辅助推理
+
+# 输入层配置
+input_gate:
+  enabled: true
+  max_input_length: 5000
+  min_input_length: 1
+  # injection_patterns: []   # 自定义注入模式（留空使用默认）
+  # sensitive_words: []       # 自定义敏感词（留空使用默认）
+
+# 安全与治理配置
+security:
+  output_guard:
+    enabled: true
+    # blocked_patterns: []  # 自定义禁止输出模式
+  human_confirmation:
+    enabled: true
+    sensitive_operations:
+      删除: "double"
+      移除: "double"
+      delete: "double"
+      remove: "double"
+      drop: "double"
+      修改: "confirm"
+      更新: "confirm"
+      update: "confirm"
+      创建: "inform"
+      添加: "inform"
+      create: "inform"
+  permissions:
+    enabled: true
+    default_role: "user"
+    rate_limit:
+      enabled: true
+      global_max_per_minute: 30       # 全局每分钟最大调用次数
+      per_tool_max_per_minute: 10     # 单工具每分钟最大调用次数
+      per_session_max_total: 200      # 单会话最大总调用次数
+      tool_overrides:                 # 特定工具的自定义限额（每分钟）
+        delete_order: 3
+        create_complex_order: 5
+
+# 执行层配置
+execution:
+  timeout: 30       # 工具执行超时秒数
+  max_retries: 1    # 最大重试次数
+  max_workers: 4    # 线程池最大工作线程
+
+# 评估配置
+evaluation:
+  rag:
+    enabled: true
+    weights:
+      retrieval_relevance: 0.25
+      faithfulness: 0.30
+      answer_relevance: 0.30
+      context_utilization: 0.15
+  agent:
+    enabled: true
+    max_records: 1000   # 最大保留任务记录数
+
+# 认证配置
+auth:
+  token_ttl_hours: 48          # Token有效期（小时），默认2天
+  data_dir: "./data/db"      # 用户和Token存储目录
+
+# 会话管理配置
+session:
+  data_dir: "./data/sessions"          # 会话数据库存储目录
+  max_sessions_per_user: 50            # 每用户最大保留会话数
+
+# 日志配置
+logging:
+  level: "DEBUG"  # DEBUG, INFO, WARNING, ERROR
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file: "./logs/agent.log"
+  console: true
