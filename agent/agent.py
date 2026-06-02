@@ -1,24 +1,25 @@
+import threading
 import uuid
-import time
 from typing import Dict, Any, List  # noqa: F401 - used in type hints
 
+from context import ContextWindowManager
+from evaluation import AgentEvaluator
+from input_gate import InputValidator
 from mcp_manager_module import MCPManager
 from memory import ShortTermMemory, LongTermMemory
 from observability import AgentTracer, get_tracer
 from rag.rag_engine import RAGEngine
-from .intent_recognizer import IntentRecognizer, TaskComplexity
-from .goal_understanding import GoalUnderstanding
-from .task_planner import TaskPlanner
-from .task_evaluator import TaskEvaluator
-from utils import setup_logger, ConfigLoader, LLMClient
-from input_gate import InputValidator
 from security import OutputGuard, RateLimiter
-from tool_manager import ToolManager
-from evaluation import AgentEvaluator
-from context import ContextWindowManager
 from session import SessionManager
-from .agent_router import AgentRouter
+from tool_manager import ToolManager
+from utils import setup_logger, ConfigLoader, LLMClient
+from utils.logger import set_trace_id
+from .goal_understanding import GoalUnderstanding
+from .intent_recognizer import IntentRecognizer
+from .orchestrator import Orchestrator
 from .product_knowledge import build_product_knowledge_base
+from .task_evaluator import TaskEvaluator
+from .task_planner import TaskPlanner
 
 
 class SmartAgent:
@@ -50,6 +51,9 @@ class SmartAgent:
         self.logger.info("=" * 60)
         self.logger.info("初始化 SmartAgent")
         self.logger.info("=" * 60)
+
+        # 记录初始化失败的组件（容错模式）
+        self._degraded_components: list = []
 
         # 初始化可观测性追踪器
         obs_config = self.config.get('observability', {})
@@ -93,17 +97,18 @@ class SmartAgent:
 
         # 初始化RAG引擎（先初始化以获取嵌入模型）
         self.logger.info("初始化RAG引擎...")
-        # 解析嵌入模型路径（相对于配置文件目录）
-        embedding_config = self.config.get('embedding', {}).copy()
-        if embedding_config.get('provider') == 'local' and embedding_config.get('model'):
-            embedding_config['model'] = self.config_loader.resolve_path(embedding_config['model'])
-            self.logger.info(f"解析嵌入模型路径: {embedding_config['model']}")
-
-        # 创建配置副本并更新嵌入配置
-        config_with_resolved_paths = self.config.copy()
-        config_with_resolved_paths['embedding'] = embedding_config
-
-        self.rag_engine = RAGEngine(config_with_resolved_paths, llm_client=self.llm_client, logger=self.logger)
+        self.rag_engine = None
+        try:
+            embedding_config = self.config.get('embedding', {}).copy()
+            if embedding_config.get('provider') == 'local' and embedding_config.get('model'):
+                embedding_config['model'] = self.config_loader.resolve_path(embedding_config['model'])
+                self.logger.info(f"解析嵌入模型路径: {embedding_config['model']}")
+            config_with_resolved_paths = self.config.copy()
+            config_with_resolved_paths['embedding'] = embedding_config
+            self.rag_engine = RAGEngine(config_with_resolved_paths, llm_client=self.llm_client, logger=self.logger)
+        except Exception as e:
+            self._degraded_components.append('rag_engine')
+            self.logger.warning(f"RAG引擎初始化失败（降级运行，知识库功能不可用）: {e}")
 
         # 初始化记忆系统
         self.logger.info("初始化记忆系统...")
@@ -136,32 +141,54 @@ class SmartAgent:
             self.logger.info("滚动总结已禁用")
 
         # 使用 RAG 引擎的嵌入模型初始化长期记忆
-        self.long_term_memory = LongTermMemory(
-            persist_directory=self.config.get('memory', {}).get('long_term', {}).get('persist_directory',
-                                                                                     './data/long_term_memory'),
-            embedding_function=self.rag_engine.embeddings,
-            logger=self.logger
-        )
-        self.long_term_memory.create_session(self.session_id)
+        self.long_term_memory = None
+        try:
+            if self.rag_engine:
+                self.long_term_memory = LongTermMemory(
+                    persist_directory=self.config.get('memory', {}).get('long_term', {}).get('persist_directory',
+                                                                                             './data/long_term_memory'),
+                    embedding_function=self.rag_engine.embeddings,
+                    logger=self.logger
+                )
+                self.long_term_memory.create_session(self.session_id)
+            else:
+                self._degraded_components.append('long_term_memory')
+                self.logger.warning("RAG引擎不可用，跳过长期记忆初始化")
+        except Exception as e:
+            self._degraded_components.append('long_term_memory')
+            self.logger.warning(f"长期记忆初始化失败（降级运行）: {e}")
 
         # 如果是恢复的历史会话，加载历史消息到短期记忆
         if self._is_resumed_session:
             self._load_session_history()
-        # 如果是新会话且有用户，在 session_manager 中创建记录
+        # 如果是新会话且有用户
         elif self.user_id:
-            self.session_manager.create_session(
-                user_id=self.user_id, title='新会话'
+            # 优先复用已有的空会话（message_count=0），避免每次登录都创建新会话
+            existing = self.session_manager.list_sessions(self.user_id, limit=3)
+            empty_session = next(
+                (s for s in existing if s.message_count == 0), None
             )
-            # 用刚创建的 session_id 替换随机生成的
-            sessions = self.session_manager.list_sessions(self.user_id, limit=1)
-            if sessions:
-                self.session_id = sessions[0].session_id
-                self.logger.info(f"新会话已持久化: {self.session_id[:8]}...")
+            if empty_session:
+                self.session_id = empty_session.session_id
+                self.logger.info(f"复用已有空会话: {self.session_id[:8]}...")
+            else:
+                self.session_manager.create_session(
+                    user_id=self.user_id, title='新会话'
+                )
+                sessions = self.session_manager.list_sessions(self.user_id, limit=1)
+                if sessions:
+                    self.session_id = sessions[0].session_id
+                    self.logger.info(f"新会话已持久化: {self.session_id[:8]}...")
 
         # 初始化MCP管理器
         mcp_config_file = self.config.get('mcp', {}).get('config_file', './config/mcp_servers.yaml')
         self.logger.info(f"初始化MCP管理器: {mcp_config_file}")
-        self.mcp_manager = MCPManager(mcp_config_file, logger=self.logger)
+        self.mcp_manager = None
+        try:
+            self.mcp_manager = MCPManager(mcp_config_file, logger=self.logger)
+        except Exception as e:
+            self._degraded_components.append('mcp_manager')
+            self.logger.warning(f"MCP管理器初始化失败（降级运行，工具调用不可用）: {e}")
 
         # 初始化意图识别器
         self.logger.info("初始化意图识别器...")
@@ -236,19 +263,22 @@ class SmartAgent:
             logger=self.logger
         )
 
-        # 子Agent路由器（售前客服 + 功能处理）
-        self.logger.info("初始化子Agent路由器...")
-        sub_agent_config = self.config.get('sub_agents', {})
-        self.agent_router = AgentRouter(
+        # 编排器：5阶段生命周期，动态创建子Agent，失败处理
+        self.logger.info("初始化Orchestrator编排器...")
+        self.orchestrator = Orchestrator(
             llm_client=self.llm_client,
-            rag_engine=self.rag_engine,
             mcp_manager=self.mcp_manager,
-            config=sub_agent_config,
+            rag_engine=self.rag_engine,
+            task_planner=self.task_planner,
+            tool_manager=self.tool_manager,
+            context_manager=self.context_manager,
+            config=self.config,
             logger=self.logger,
         )
 
-        # 商品知识库（售前子Agent依赖）
-        if sub_agent_config.get('presale', {}).get('init_product_kb', True):
+        # 商品知识库（RAG依赖）
+        sub_agent_config = self.config.get('sub_agents', {})
+        if sub_agent_config.get('init_product_kb', True) and self.rag_engine:
             try:
                 self.logger.info("初始化商品FAQ知识库...")
                 faq_count = build_product_knowledge_base(self.rag_engine, self.logger)
@@ -271,7 +301,12 @@ class SmartAgent:
         self.logger.info(
             f"响应摘要功能: {'启用' if self.response_summary_enabled else '禁用'}, 最大长度阈值: {self.response_max_length}")
 
-        self.logger.info("SmartAgent 初始化完成！")
+        if self._degraded_components:
+            self.logger.warning(
+                f"SmartAgent 初始化完成（降级模式）| 不可用组件: {self._degraded_components}"
+            )
+        else:
+            self.logger.info("SmartAgent 初始化完成！（全功能模式）")
         self.logger.info("=" * 60)
 
     def chat(self, user_input: str, verbose: bool = True) -> str:
@@ -288,9 +323,14 @@ class SmartAgent:
         Returns:
             Agent的回复
         """
+        # ========== 快捷命令拦截（在所有流程之前，直接返回）==========
+        _cmd = user_input.strip().lower()
+        if _cmd in ('/clear_memory', '/清空记忆'):
+            return self.clear_long_term_memory()
+
         tracer = get_tracer()
         task_id = str(uuid.uuid4())[:8]
-        start_time = time.time()
+        set_trace_id(task_id)  # 绑定请求级 trace ID，同一请求内所有日志携带该 ID
 
         with tracer.start_span("agent.chat", {
             "agent.session_id": self.session_id,
@@ -342,15 +382,27 @@ class SmartAgent:
 
                 # Orchestrator enriche：解析用户对子Agent结果的引用（如"方案一"→具体商品）
                 sub_agent_enabled = self.config.get('sub_agents', {}).get('enabled', True)
-                if sub_agent_enabled and hasattr(self, 'agent_router'):
-                    context = self.agent_router.enrich_context(user_input, context)
+                if sub_agent_enabled and hasattr(self, 'orchestrator'):
+                    context = self.orchestrator.enrich_context(user_input, context)
 
                 self.logger.info(f"从短期记忆中获取到的上下文：{context}")
 
                 # 检索相关的长期记忆（语义搜索历史对话）
-                relevant_long_term = self._retrieve_relevant_long_term_context(user_input, top_k=3)
+                relevant_long_term = ""
+                if self.long_term_memory and 'long_term_memory' not in self._degraded_components:
+                    relevant_long_term = self._retrieve_relevant_long_term_context(user_input, top_k=3)
                 if relevant_long_term:
                     self.logger.info(f"检索到相关历史对话")
+
+                # 注入用户偏好（预算/兴趣/品牌等，来自增量偏好记忆）
+                if self.user_id and self.long_term_memory and 'long_term_memory' not in self._degraded_components:
+                    try:
+                        pref_ctx = self.long_term_memory.format_user_preferences(self.user_id)
+                        if pref_ctx:
+                            relevant_long_term = (pref_ctx + "\n\n" + relevant_long_term).strip()
+                            self.logger.info(f"已注入用户偏好上下文")
+                    except Exception as _e:
+                        self.logger.debug(f"加载用户偏好失败（不影响主流程）: {_e}")
 
                 tracer.set_span_attributes({
                     "memory.context_length": len(context),
@@ -360,8 +412,8 @@ class SmartAgent:
             # ========== 1. 目标理解层（增强意图识别 + 澄清机制） ==========
             # 获取orchestrator结构化记忆，供参数完整性检查使用
             orchestrator_ctx = ""
-            if sub_agent_enabled and hasattr(self, 'agent_router'):
-                orchestrator_ctx = self.agent_router.memory.get_context_for_sub_agent()
+            if sub_agent_enabled and hasattr(self, 'orchestrator'):
+                orchestrator_ctx = self.orchestrator.memory.get_context_for_sub_agent()
             self.logger.info(
                 f"[主Agent] 传入目标理解层 | user_input: {user_input[:80]} | "
                 f"context_len: {len(context)} | orch_ctx_len: {len(orchestrator_ctx)}"
@@ -411,65 +463,35 @@ class SmartAgent:
                 complexity=intent_result.complexity.value,
             )
 
-            # ========== 2. 子Agent路由 + 任务规划与执行 ==========
-            sub_agent_enabled = self.config.get('sub_agents', {}).get('enabled', True)
-            route_target = None
-            if sub_agent_enabled:
-                route_target = self.agent_router.route(user_input, intent_result, context)
-
-            # 路由决策：
-            # - 简单任务 + 匹配子Agent → 子Agent直接处理（单步执行）
-            # - 中等/复杂任务 → 主Agent规划执行（保留复杂性识别、任务规划、依赖管理）
-            # - 无匹配子Agent → 主Agent原有逻辑处理
-            use_sub_agent_direct = (
-                route_target
-                and intent_result.complexity == TaskComplexity.SIMPLE
+            # ========== 2. Orchestrator统一执行 ==========
+            # 主Agent的三重身份：
+            # a) 执行者 —— 简单任务自己通过TaskPlanner完成
+            # b) 指挥官 —— 中等/复杂任务分解、动态创建子Agent委派、汇总
+            # c) 对话者 —— 唯一与用户直接交互
+            #
+            # Orchestrator根据复杂度自动决策：
+            # - SIMPLE → 主Agent直接执行（不创建子Agent）
+            # - MEDIUM/COMPLEX → 5阶段生命周期（理解→规划→执行→整合→交付）
+            #   其中执行阶段会动态创建子Agent处理可并行/上下文溢出/离题的子任务
+            response = self.orchestrator.handle_request(
+                user_query=user_input,
+                intent_result=intent_result,
+                context=context,
+                long_term_context=relevant_long_term,
+                user_id=self.user_id or "",
+                username=self.username or "",
+                verbose=verbose,
             )
 
-            if use_sub_agent_direct:
-                # 简单任务：子Agent直接处理
-                if verbose:
-                    route_label = "🛒 售前客服" if route_target == AgentRouter.ROUTE_PRESALE else "⚙️ 功能处理"
-                    print(f"{route_label} 子Agent正在处理...\n")
-                self.logger.info(f"简单任务路由到子Agent: {route_target}")
-                response = self.agent_router.dispatch(
-                    route=route_target,
-                    user_query=user_input,
-                    context=context,
-                    user_id=self.user_id or "",
-                    username=self.username or "",
-                    tool_name=getattr(intent_result, 'tool_name', '') or '',
-                    long_term_context=relevant_long_term,
-                )
-            else:
-                # 中等/复杂任务 或 无匹配子Agent：主Agent规划执行
-                planning_context = context
-                # 统一注入orchestrator结构化记忆（已选方案、实体、决策等）
-                if orchestrator_ctx:
-                    planning_context += f"\n[Orchestrator已知信息]\n{orchestrator_ctx}"
-                if route_target:
-                    if verbose:
-                        route_label = "🛒 售前" if route_target == AgentRouter.ROUTE_PRESALE else "⚙️ 功能"
-                        print(f"📊 {route_label}域任务 | 复杂度: {intent_result.complexity.value} → 主Agent规划执行\n")
-                    self.logger.info(
-                        f"中等/复杂任务由主Agent规划执行 | route={route_target} | "
-                        f"complexity={intent_result.complexity.value}"
+            # 持久化任务状态（支持会话恢复时重建）
+            task_state = self.orchestrator.get_current_task_state()
+            if task_state and self.user_id:
+                try:
+                    self.session_manager.save_task_state(
+                        self.session_id, task_state.to_json()
                     )
-
-                response = self.task_planner.execute(
-                    user_query=user_input,
-                    intent=intent_result,
-                    context=planning_context,
-                    long_term_context=relevant_long_term,
-                    verbose=verbose,
-                    on_step_complete=self.agent_router.memory.extract_entities_from_step_result,
-                )
-
-                # 子Agent域内的任务完成后，同步更新orchestrator记忆
-                if route_target and sub_agent_enabled:
-                    self.agent_router.memory.update_from_sub_agent_result(
-                        route=route_target, query=user_input, response=response,
-                    )
+                except Exception as e:
+                    self.logger.debug(f"任务状态持久化失败（不影响主流程）: {e}")
 
             # ========== 3. 输出层：安全审查 ==========
             review_result = self.output_guard.review(response)
@@ -500,11 +522,16 @@ class SmartAgent:
                 if self.conversation_count % self.summary_threshold == 0:
                     self._generate_long_term_summary()
 
+                # 增量提取并存储用户偏好（预算/兴趣/品牌等）
+                if self.user_id and self.long_term_memory and 'long_term_memory' not in self._degraded_components:
+                    self._update_user_preferences_from_turn(user_input, response)
+
             # ========== 4. Agent评估：记录任务完成 ==========
+            exec_failed = getattr(self.orchestrator, '_last_request_failed', False)
             self.agent_evaluator.task_completed(
                 task_id=task_id,
-                success=True,
-                error="",
+                success=not exec_failed,
+                error="执行降级" if exec_failed else "",
             )
 
             self.logger.info(f"Agent回复: {response[:100]}...")
@@ -522,10 +549,12 @@ class SmartAgent:
     def _retrieve_relevant_long_term_context(self, query: str, top_k: int = 3) -> str:
         """检索相关的长期记忆上下文"""
         try:
-            # 搜索当前会话的相关历史对话
+            if not self.long_term_memory:
+                return ""
+            # 跨会话搜索用户的相关历史对话
             similar_convs = self.long_term_memory.search_similar_conversations(
                 query=query,
-                session_id=self.session_id,
+                user_id=self.user_id,
                 n_results=top_k
             )
 
@@ -576,17 +605,6 @@ class SmartAgent:
             return response[:self.response_max_length] + "...(已截断)"
 
     def _summarize_response(self, response: str, user_input: str, context: str) -> str:
-        """
-        使用LLM提取响应中的关键信息
-        
-        Args:
-            response: 完整响应
-            user_input: 用户输入
-            context: 对话上下文
-            
-        Returns:
-            提取的关键信息摘要
-        """
         prompt = f"""你是一个信息提取助手。用户刚刚提出了一个问题，AI助手给出了一个详细的回答。现在需要从这个回答中提取核心信息，用于后续对话的上下文记忆。
 
 用户问题：
@@ -606,6 +624,17 @@ class SmartAgent:
 8. 保持信息的准确性和可理解性
 
 提取的关键信息："""
+        """
+        使用LLM提取响应中的关键信息
+        
+        Args:
+            response: 完整响应
+            user_input: 用户输入
+            context: 对话上下文
+            
+        Returns:
+            提取的关键信息摘要
+        """
 
         summary = self.llm_client.generate(
             prompt=prompt,
@@ -758,6 +787,7 @@ class SmartAgent:
             # 保存到长期记忆
             self.long_term_memory.add_conversation_summary(
                 session_id=self.session_id,
+                user_id=self.user_id or "",
                 summary=summary,
                 topics=topics
             )
@@ -765,6 +795,70 @@ class SmartAgent:
             self.logger.info("长期记忆总结已保存")
         except Exception as e:
             self.logger.error(f"生成长期记忆总结失败: {e}")
+
+    def _update_user_preferences_from_turn(self, user_input: str, response: str) -> None:
+        """从当前对话轮次提取用户偏好并增量存储（后台线程，不阻塞主响应）。
+
+        只提取本轮明确提到的偏好信息，发生异常时静默失败。
+        """
+        user_id = self.user_id  # 捕获引用，避免闭包问题
+
+        def _task():
+            try:
+                prefs = self._extract_user_preferences(user_input, response)
+                if prefs:
+                    self.long_term_memory.update_user_preferences(user_id, prefs)
+                    self.logger.info(f"[后台] 用户偏好已更新: {list(prefs.keys())}")
+            except Exception as e:
+                self.logger.debug(f"[后台] 偏好更新失败（不影响主流程）: {e}")
+
+        t = threading.Thread(target=_task, daemon=True, name="pref-update")
+        t.start()
+
+    def _extract_user_preferences(self, user_input: str, response: str) -> dict:
+        """使用 LLM 从对话轮次中提取用户偏好信息。
+
+        只提取本轮明确出现的信息，未提及的字段不包含在返回中。
+
+        Returns:
+            偏好字典，可能为空 dict（无偏好信息时）
+        """
+        import json as _json
+        import re as _re
+
+        prompt = f"""从以下对话中提取用户的偏好信息（仅提取本轮明确提到的内容）。
+
+用户: {user_input}
+助手: {response[:400]}
+
+请以JSON格式返回，只包含本轮对话中**明确出现**的偏好字段：
+{{
+  "budget": "预算限制（如'2万以内'，未提到则不填此字段）",
+  "interests": "兴趣/偏好品类（如'电子产品'，未提到则不填此字段）",
+  "preferred_brands": "偏好品牌（未提到则不填此字段）",
+  "usage_scenario": "使用场景（如'办公'、'游戏'，未提到则不填此字段）"
+}}
+
+规则：
+- 没有明确提到的字段**不要**包含在JSON中
+- 如果本轮没有任何偏好信息，返回 {{}}
+- 只返回JSON，不要其他内容"""
+
+        try:
+            resp = self.llm_client.generate(prompt=prompt, temperature=0.1).strip()
+            code_block = _re.search(r'```(?:json)?\s*\n?(.*?)\n?```', resp, _re.DOTALL)
+            if code_block:
+                resp = code_block.group(1).strip()
+            brace_start = resp.find('{')
+            brace_end = resp.rfind('}')
+            if brace_start >= 0 and brace_end > brace_start:
+                resp = resp[brace_start:brace_end + 1]
+            prefs = _json.loads(resp)
+            # 过滤掉空值
+            return {k: v for k, v in prefs.items() if v and str(v).strip()}
+        except Exception as e:
+            self.logger.debug(f"偏好提取失败: {e}")
+            return {}
 
     def add_documents_to_knowledge_base(
             self,
@@ -793,6 +887,25 @@ class SmartAgent:
     def get_knowledge_base_info(self) -> Dict[str, Any]:
         """获取知识库信息"""
         return self.rag_engine.get_collection_info()
+
+    def get_health_status(self) -> dict:
+        """获取 Agent 各组件的健康状态
+
+        Returns:
+            {'status': 'ok'|'degraded', 'degraded_components': [...], 'available_features': {...}}
+        """
+        available = {
+            'chat': True,           # LLMClient 始终可用（初始化失败会抛出异常）
+            'rag': self.rag_engine is not None,
+            'mcp_tools': self.mcp_manager is not None,
+            'long_term_memory': self.long_term_memory is not None,
+            'session_persistence': self.user_id is not None,
+        }
+        return {
+            'status': 'degraded' if self._degraded_components else 'ok',
+            'degraded_components': list(self._degraded_components),
+            'available_features': available,
+        }
 
     def list_mcp_services(self) -> List[Dict[str, Any]]:
         """列出可用的MCP服务"""
@@ -823,8 +936,10 @@ class SmartAgent:
         return self.short_term_memory.get_messages(last_n)
 
     def get_long_term_summaries(self, limit: int = 5) -> List[Dict[str, Any]]:
-        """获取长期记忆总结"""
-        return self.long_term_memory.get_session_summaries(self.session_id, limit)
+        """获取长期记忆总结（用户维度，跨会话）"""
+        if not self.long_term_memory:
+            return []
+        return self.long_term_memory.get_user_summaries(self.user_id or "", limit)
 
     def clear_short_term_memory(self):
         """清空短期记忆"""
@@ -876,6 +991,38 @@ class SmartAgent:
 
         return deleted
 
+    def clear_long_term_memory(self) -> str:
+        """清空当前用户的长期记忆（对话摘要 + 用户偏好）。
+
+        由 /clear_memory 命令触发，不影响短期记忆和当前会话消息。
+
+        Returns:
+            面向用户的操作结果说明
+        """
+        if not self.long_term_memory:
+            return "长期记忆不可用（RAG 引擎未初始化）。"
+
+        cleared = []
+
+        # 清除当前用户的全部对话摘要（跨会话）
+        conv_count = self.long_term_memory.clear_conversation_summaries(self.user_id or "")
+        if conv_count > 0:
+            cleared.append(f"对话摘要 {conv_count} 条")
+
+        # 清除当前用户的全部偏好
+        if self.user_id:
+            pref_count = self.long_term_memory.clear_all_user_preferences(self.user_id)
+            if pref_count > 0:
+                cleared.append(f"用户偏好 {pref_count} 条")
+
+        if cleared:
+            msg = f"已清空长期记忆：{', '.join(cleared)}。"
+        else:
+            msg = "长期记忆本就是空的，无需清理。"
+
+        self.logger.info(f"[Command /clear_memory] {msg}")
+        return msg
+
     def reset_session(self):
         """重置会话（创建新会话）"""
         self.short_term_memory.clear()
@@ -887,7 +1034,8 @@ class SmartAgent:
         else:
             self.session_id = str(uuid.uuid4())
 
-        self.long_term_memory.create_session(self.session_id)
+        if self.long_term_memory:
+            self.long_term_memory.create_session(self.session_id)
         self._is_resumed_session = False
         self.logger.info(f"会话已重置，新会话ID: {self.session_id}")
 
@@ -909,7 +1057,8 @@ class SmartAgent:
         self.session_id = session_id
         self._is_resumed_session = True
         self.short_term_memory.clear()
-        self.long_term_memory.create_session(self.session_id)
+        if self.long_term_memory:
+            self.long_term_memory.create_session(self.session_id)
         self._load_session_history()
         self.logger.info(f"已恢复会话: {session_id[:8]}... | 标题: {session_info.title}")
         return True
@@ -928,7 +1077,7 @@ class SmartAgent:
         self.logger.info(f"注册了 {len(LOCAL_TOOLS)} 个本地工具")
 
     def _load_session_history(self):
-        """从会话存储加载历史消息到短期记忆"""
+        """从会话存储加载历史消息到短期记忆，并恢复上一次的任务状态"""
         messages = self.session_manager.get_messages(self.session_id)
         if not messages:
             self.logger.info("历史会话无消息")
@@ -942,6 +1091,21 @@ class SmartAgent:
             self.short_term_memory.add_message(msg['role'], msg['content'])
 
         self.conversation_count = len(messages) // 2  # 估算对话轮数
+
+        # 通过专用方法恢复上一次的任务状态到Orchestrator
+        if hasattr(self, 'orchestrator'):
+            try:
+                import json
+                task_state_json = self.session_manager.get_last_task_state(self.session_id)
+                if task_state_json:
+                    state_data = json.loads(task_state_json)
+                    self.orchestrator.restore_task_state(state_data)
+                    self.logger.info(
+                        f"已恢复上一次任务状态: phase={state_data.get('phase', '?')}"
+                    )
+            except Exception as e:
+                self.logger.warning(f"恢复任务状态失败（不影响主功能）: {e}")
+
         self.logger.info(
             f"从会话存储加载 {len(recent)}/{len(messages)} 条消息到短期记忆"
         )

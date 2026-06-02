@@ -15,6 +15,7 @@ import os
 import secrets
 import time
 from dataclasses import dataclass, asdict
+from datetime import datetime
 from typing import Dict, Any, Optional
 
 from utils.db_pool import ConnectionPool
@@ -67,7 +68,6 @@ class AuthManager:
         db_path = os.path.join(self.data_dir, 'app.db')
         pool_size = auth_config.get('pool_size', 3)
         self._pool = ConnectionPool(db_path, max_size=pool_size)
-        self._init_db()
 
         # 本地 Token 缓存（JSON 文件，仅客户端用于免登录）
         self.tokens_file = os.path.join(self.data_dir, 'tokens.json')
@@ -76,50 +76,6 @@ class AuthManager:
         self.logger.info(
             f"AuthManager 初始化 | DB: {db_path} | Token有效期: {self.token_ttl // 3600}h"
         )
-
-    # ================================================================
-    # 数据库初始化
-    # ================================================================
-
-    def _init_db(self):
-        """初始化用户表，并写入默认演示用户"""
-        with self._pool.get_conn() as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id       TEXT PRIMARY KEY,
-                    username      TEXT NOT NULL UNIQUE,
-                    password_hash TEXT NOT NULL,
-                    salt          TEXT NOT NULL,
-                    created_at    REAL NOT NULL
-                )
-            """)
-            conn.execute("""
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username
-                ON users(username)
-            """)
-            conn.commit()
-
-            # 若表为空，插入默认演示用户
-            count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-            if count == 0:
-                self._seed_default_users(conn)
-
-    def _seed_default_users(self, conn):
-        """写入默认演示用户（首次初始化时调用）"""
-        defaults = [
-            ('admin', 'admin123'),
-            ('test', 'test123'),
-        ]
-        for username, password in defaults:
-            salt = secrets.token_hex(16)
-            user_id = f"U-{secrets.token_hex(4).upper()}"
-            conn.execute(
-                "INSERT OR IGNORE INTO users (user_id, username, password_hash, salt, created_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (user_id, username, self._hash_password(password, salt), salt, time.time())
-            )
-        conn.commit()
-        self.logger.info(f"已创建 {len(defaults)} 个默认用户")
 
     # ================================================================
     # 公开接口
@@ -243,7 +199,8 @@ class AuthManager:
             conn.execute(
                 "INSERT INTO users (user_id, username, password_hash, salt, created_at) "
                 "VALUES (?, ?, ?, ?, ?)",
-                (user_id, username, self._hash_password(password, salt), salt, time.time())
+                (user_id, username, self._hash_password(password, salt), salt,
+                 datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
             )
             conn.commit()
 

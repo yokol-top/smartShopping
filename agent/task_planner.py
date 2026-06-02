@@ -81,8 +81,17 @@ class TaskPlanner:
         self.eval_mid_enabled = eval_config.get('mid_evaluation', True)
         self.eval_post_enabled = eval_config.get('post_evaluation', True)
 
-        self._tool_executor = None  # 可选的子Agent工具执行回调
-        self._on_step_complete = None  # 可选的步骤完成回调
+        self._on_step_complete = None  # 步骤完成回调（供 orchestrator 记忆提取用）
+
+        # 工具调用器（MCP/本地工具执行逻辑独立维护）
+        from .tool_caller import ToolCaller
+        self._tool_caller = ToolCaller(
+            llm_client=llm_client,
+            mcp_manager=mcp_manager,
+            tool_manager=tool_manager,
+            context_manager=context_manager,
+            logger=logger,
+        )
         self.logger.info(
             f"TaskPlanner 初始化完成 | 评估开关: pre={self.eval_pre_enabled} "
             f"mid={self.eval_mid_enabled} post={self.eval_post_enabled}"
@@ -93,19 +102,13 @@ class TaskPlanner:
     # ================================================================
     def execute(self, user_query: str, intent: IntentResult, context: str = "",
                 long_term_context: str = "", verbose: bool = True,
-                tool_executor=None, on_step_complete=None) -> str:
+                on_step_complete=None) -> str:
         """根据意图识别结果执行任务
 
         Args:
-            tool_executor: 可选的工具执行回调，签名为
-                (tool_name, step_desc, user_query, context, history) -> Optional[str]
-                返回None表示该工具不由外部执行，回退到内置MCP调用。
-                用于将子Agent作为任务执行节点集成到规划流程中。
-            on_step_complete: 可选的步骤完成回调，签名为 (step_result: str) -> None
-                每个步骤执行完成后调用，用于从结果中提取实体信息（ID等）
-                存入orchestrator记忆，避免后续步骤重复查询。
+            on_step_complete: 可选的步骤完成回调 (step_result: str) -> None
+                每步完成后调用，用于从结果中提取实体信息存入 orchestrator 记忆。
         """
-        self._tool_executor = tool_executor
         self._on_step_complete = on_step_complete
         tracer = get_tracer()
 
@@ -438,8 +441,12 @@ class TaskPlanner:
         Args:
             completed_history: 已完成的步骤历史（重规划时传入，避免重复执行）
         """
-        # 上下文工程：懒加载工具描述（仅名称+描述，不含schema）
-        tools_desc = self._get_tools_desc(brief=True)
+        # 上下文工程：懒加载工具描述（仅名称+描述，不含schema；按意图类型过滤）
+        tools_desc = self._get_tools_desc(
+            brief=True,
+            intent_type=intent.intent_type.value,
+            query=user_query,
+        )
         # 上下文工程：动态预算分配 + 分区预算管理
         if self.context_manager:
             active = ['short_term_memory', 'tools', 'planning_steps', 'tool_results']
@@ -568,125 +575,28 @@ action_type说明:
     # ReAct循环（简单任务使用）
     # ================================================================
     def _react_loop(self, user_query, intent, context, long_term_context, verbose):
-        """简单任务的ReAct循环执行"""
-        tracer = get_tracer()
-        self.logger.info("ReAct单步执行")
-        # 选择性懒加载：用 brief 模式列出所有工具，仅为意图识别出的目标工具加载完整 schema
-        # 这样既能让 LLM 知道所有可用工具，又能正确填充目标工具的参数，同时大幅节省上下文空间
-        target_tool = intent.tool_name if intent else None
-        tools_desc = self._get_tools_desc(brief=True, target_tool=target_tool)
-        # 上下文工程：动态预算分配 + 分区预算管理
-        if self.context_manager:
-            active = ['short_term_memory', 'tools', 'tool_results']
-            if long_term_context:
-                active.append('long_term_memory')
-            self.context_manager.set_active_sections(active)
-            context = self.context_manager.manage_section('short_term_memory', context)
-            long_term_context = self.context_manager.manage_section('long_term_memory', long_term_context)
-            tools_desc = self.context_manager.manage_section('tools', tools_desc)
-        thoughts_actions = []
-
-        for iteration in range(self.react_max_iterations):
-            if verbose:
-                print(f"\n🔄 第 {iteration + 1} 轮思考\n")
-
-            with tracer.start_span(f"task.react_iteration.{iteration + 1}", {
-                "react.iteration": iteration + 1,
-            }):
-                history = self._format_react_history(thoughts_actions)
-                # 上下文工程：管理工具执行结果预算
-                if self.context_manager and history:
-                    history = self.context_manager.manage_section('tool_results', history)
-                prompt_parts = []
-                if long_term_context:
-                    prompt_parts.append(long_term_context)
-                    prompt_parts.append("")
-                prompt_parts.append(f"""你是一个能够使用工具完成任务的AI助手。
-
-用户任务: {user_query}
-
-对话历史:
-{context}
-
-可用工具:
-{tools_desc}
-
-已完成的步骤:
-{history if history else "（尚未开始）"}
-
-**⚠️ 关键规则（必须严格遵守）**:
-1. 先仔细检查"已完成的步骤"中的观察结果。如果观察结果已包含"成功"、"完成"等信息，说明任务已完成，必须立即使用 Action: finish 返回结果。
-2. 绝对不要重复执行已经成功的操作。如果某个工具调用已经成功返回结果，不要再次调用同一工具。
-3. 每一轮的Thought中必须先总结已完成步骤的结果，再决定下一步。
-4. 如果缺少必要参数，请不要自行补充，应该立刻终止执行，然后提示用户补充。
-
-请严格按照以下格式回复：
-
-Thought: [先总结已完成步骤的结果，再分析是否需要继续]
-Action: [search_knowledge / call_mcp_tool / finish]
-Action Input: [JSON格式参数]
-
-Action Input格式：
-- search_knowledge: {{"query": "搜索关键词"}}
-- call_mcp_tool: {{"tool_name": "工具名", "parameters": {{具体参数}}}}
-- finish: {{"answer": "最终答案"}}
-
-如果任务已完成、缺少必要参数，使用 Action: finish。""")
-
-                prompt = "\n".join(prompt_parts)
-                react_response = self.llm_client.generate(prompt=prompt, temperature=self.react_temperature)
-                self.logger.info(f"[ReAct] LLM原始响应 (前500字符):\n{react_response[:500] if react_response else '(空)'}")
-                thought, action, action_input = self._parse_react_response(react_response)
-
-                tracer.set_span_attributes({
-                    "react.thought": thought,
-                    "react.action": action,
-                })
-
-                if verbose:
-                    print(f"💭 思考: {thought}")
-                    print(f"⚡ 行动: {action}")
-                    print(f"📥 输入: {action_input}\n")
-
-                thoughts_actions.append({'thought': thought, 'action': action, 'action_input': action_input})
-
-                if action == "finish":
-                    return action_input.get('answer', '任务已完成')
-
-                # 防重复保护：检测是否与之前已成功的步骤完全相同
-                if self._is_duplicate_action(action, action_input, thoughts_actions[:-1]):
-                    self.logger.warning("检测到重复操作，强制结束")
-                    if verbose:
-                        print("⚠️ 检测到重复操作，自动结束任务\n")
-                    return self._summarize_history(user_query, thoughts_actions[:-1])
-
-                if action == "search_knowledge":
-                    observation = self._exec_rag_search(action_input.get('query', user_query), context)
-                elif action == "call_mcp_tool":
-                    observation = self._exec_mcp_call(action_input.get('tool_name', ''),
-                                                       action_input.get('parameters', {}))
-                else:
-                    observation = f"未知动作: {action}"
-                    # 连续未知动作计数，超过2次强制终止
-                    consecutive_unknown = sum(
-                        1 for ta in thoughts_actions
-                        if ta.get('observation', '').startswith('未知动作')
-                    )
-                    if consecutive_unknown >= 2:
-                        self.logger.warning(f"连续 {consecutive_unknown} 次未知动作，强制终止 ReAct")
-                        if verbose:
-                            print("⚠️ 多次调用了不存在的工具，自动结束任务\n")
-                        return self._summarize_history(user_query, thoughts_actions)
-
-                thoughts_actions[-1]['observation'] = observation
-                tracer.set_span_attributes({"react.observation_preview": observation[:300]})
-
-                if verbose:
-                    preview = observation[:200] + ('...' if len(observation) > 200 else '')
-                    print(f"👀 观察: {preview}\n")
-
-        # 达到最大迭代，总结返回
-        return self._summarize_history(user_query, thoughts_actions)
+        """简单任务的ReAct循环执行（委托给 UnifiedReActExecutor）"""
+        from .unified_react_executor import UnifiedReActExecutor, ReActConfig
+        executor = UnifiedReActExecutor(
+            llm_client=self.llm_client,
+            mcp_manager=self.mcp_manager,
+            rag_engine=self.rag_engine,
+            context_manager=self.context_manager,
+            logger=self.logger,
+        )
+        cfg = ReActConfig(
+            max_iterations=self.react_max_iterations,
+            temperature=self.react_temperature,
+            allowed_tools=None,   # TaskPlanner 无工具白名单限制
+            enable_rag=True,
+        )
+        return executor.execute(
+            task_desc=user_query,
+            context=context,
+            long_term_context=long_term_context,
+            verbose=verbose,
+            config=cfg,
+        )
 
     # ================================================================
     # 单步执行
@@ -701,15 +611,6 @@ Action Input格式：
         elif action_type == "call_mcp_tool":
             tool_name = action_input.get('tool_name', '')
 
-            # 优先尝试委托子Agent执行（子Agent作为任务执行节点）
-            if self._tool_executor:
-                delegated = self._tool_executor(
-                    tool_name, step.description, user_query, context, execution_history
-                )
-                if delegated is not None:
-                    self.logger.info(f"[TaskPlanner] 步骤已委托子Agent执行: {tool_name}")
-                    return delegated
-
             parameters = action_input.get('parameters', {})
             # 必须动态提取参数的情况：
             # 1. 参数为空或含占位符
@@ -718,68 +619,12 @@ Action Input格式：
             has_prior_results = bool(execution_history)
             lazy_loading = bool(self.context_manager)
             if not parameters or self._has_placeholder(parameters) or has_prior_results or lazy_loading:
-                return self._extract_and_call_mcp(tool_name, step.description, user_query, context, long_term_context, execution_history, verbose)
-            return self._exec_mcp_call(tool_name, parameters)
+                return self._tool_caller.extract_params_and_call(tool_name, step.description, user_query, context, long_term_context, execution_history, verbose)
+            return self._tool_caller.call(tool_name, parameters)
         elif action_type == "generate_answer":
             return self._gen_step_answer(user_query, step.description, execution_history, context, long_term_context)
         else:
             return f"未知的action_type: {action_type}"
-
-    def _extract_and_call_mcp(self, tool_name, step_description, user_query, context, long_term_context, execution_history, verbose):
-        """使用LLM提取参数并调用MCP工具（懒加载：此时才加载完整schema）"""
-        # 上下文工程：懒加载第二阶段 - 仅在需要填充参数时才加载完整 Input Schema
-        schema = self._get_tool_schema(tool_name)
-        if not schema:
-            return f"未找到工具 {tool_name} 的schema"
-
-        schema_json = json.dumps(self._compress_schema(schema), ensure_ascii=False)
-        hist = "\n".join(f"- {h['description']}: {h.get('result', '')[:500]}" for h in execution_history)
-
-        # 上下文工程：动态预算分配 + 分区预算管理
-        if self.context_manager:
-            active = ['short_term_memory', 'tool_results']
-            if long_term_context:
-                active.append('long_term_memory')
-            self.context_manager.set_active_sections(active)
-            context = self.context_manager.manage_section('short_term_memory', context)
-            long_term_context = self.context_manager.manage_section('long_term_memory', long_term_context)
-            if hist:
-                hist = self.context_manager.manage_section('tool_results', hist)
-
-        prompt_parts = []
-        if long_term_context:
-            prompt_parts.append(long_term_context)
-        prompt_parts.append(f"""你是一个工具调用助手。请根据当前步骤的目标，从上下文中提取工具参数。
-
-当前步骤目标: {step_description}
-
-用户请求: {user_query}
-对话历史: {context}
-前置步骤结果:
-{hist if hist else "（无）"}
-
-工具名: {tool_name}
-工具参数结构（JSON Schema）:
-{schema_json}
-
-**关键规则**:
-1. 只提取与"当前步骤目标"相关的参数。用户请求可能包含多个操作，但本次调用只负责当前步骤描述的那一个操作，与当前步骤无关的字段设为null或不填。
-2. 严格按照schema结构提取参数，必需参数必须提供。
-3. 如果前置步骤结果中包含了本次调用所需的动态值（如用户ID、订单号等），必须使用前置步骤返回的实际值，不要编造或使用默认值。
-4. 参数优先级：前置步骤结果 > 用户请求中的信息 > 默认值。
-5. 根据上下文智能推断操作类型：步骤描述仅供参考。如果schema中包含操作类型字段（如action: add/update/delete），需根据实际情况选择——前置步骤刚创建了新实体时，后续为该实体新增数据应使用"add"而非"update"。
-6. 如果某个必需的ID字段在上下文中不存在（如刚创建的实体还没有子资源ID），说明应使用创建/新增操作而非更新操作。
-
-只返回JSON。""")
-
-        try:
-            param_json = self.llm_client.generate(prompt="\n".join(prompt_parts), temperature=0.3)
-            parameters = json.loads(self._clean_json(param_json))
-            if verbose:
-                print(f"📋 提取参数: {json.dumps(parameters, ensure_ascii=False, indent=2)}\n")
-            return self._exec_mcp_call(tool_name, parameters)
-        except Exception as e:
-            return f"参数提取失败: {e}"
 
     # ================================================================
     # 基础执行方法
@@ -807,6 +652,10 @@ Action Input格式：
 
     def _rag_query(self, user_query, context, long_term_context, advanced=False, verbose=True):
         """RAG检索并回答"""
+        if not self.rag_engine:
+            self.logger.warning("RAG引擎不可用，降级为直接对话")
+            return self._direct_chat(user_query, context, long_term_context)
+
         if verbose:
             print("🚀 使用高级RAG技术处理查询...\n" if advanced else "🔎 正在搜索知识库...\n")
 
@@ -846,11 +695,14 @@ Action Input格式：
             answer = self.llm_client.generate(prompt="\n".join(parts)).strip()
 
             # Self-fix验证（仅高级模式）
-            if advanced and self.config.get('../rag', {}).get('self_fix', {}).get('enabled', True):
+            if advanced and self.config.get('rag', {}).get('self_fix', {}).get('enabled', True):
                 if verbose:
                     print("🔍 正在验证答案质量...\n")
                 contexts = [r['document'] for r in results]
-                fix_result = self.rag_engine.self_fix.verify_and_fix(query=user_query, answer=answer, context=contexts)
+                fix_result = self.rag_engine.self_fix.verify_and_fix(
+                    query=user_query, answer=answer, context=contexts,
+                    conversation_context=context,
+                )
                 if fix_result['fixed']:
                     if verbose:
                         print(f"✨ 答案已优化（迭代 {fix_result['iterations']} 次）\n")
@@ -865,6 +717,8 @@ Action Input格式：
 
     def _exec_rag_search(self, query, context):
         """执行RAG搜索"""
+        if not self.rag_engine:
+            return "知识库不可用"
         try:
             results = self.rag_engine.retrieve(query=query, context=context, top_k=3, use_advanced=False)
             if not results:
@@ -874,51 +728,13 @@ Action Input格式：
         except Exception as e:
             return f"RAG检索失败: {str(e)}"
 
-    def _exec_mcp_call(self, tool_name, parameters):
-        """执行工具调用（MCP 或本地工具）
-
-        Returns:
-            统一格式字符串：成功 "工具执行成功: {JSON结果}" / 失败 "工具执行失败: {原因}"
-        """
-        # 频率限制检查
-        if self.tool_manager and self.tool_manager.rate_limiter:
-            check = self.tool_manager.rate_limiter.check(tool_name)
-            if not check.allowed:
-                self.logger.warning(f"工具调用被频率限制: {check.reason}")
-                return f"工具执行失败: {check.reason}"
-
-        try:
-            # 优先检查是否为本地工具
-            if self.tool_manager:
-                tool_info = self.tool_manager.get_tool(tool_name)
-                if tool_info and tool_info.source == "local":
-                    self.logger.info(f"调用本地工具: {tool_name}")
-                    result = self.tool_manager.call_local_tool(tool_name, parameters)
-                    return f"工具执行成功: {json.dumps(result, ensure_ascii=False)}"
-
-            # MCP 工具调用
-            server_name = self._find_tool_server(tool_name)
-            if not server_name:
-                return f"工具执行失败: 找不到工具 {tool_name} 所属的服务"
-            self.logger.info(f"调用MCP - 服务: {server_name}, 工具: {tool_name}")
-            result = self.mcp_manager.call_tool(server_name=server_name, tool_name=tool_name, parameters=parameters)
-            if isinstance(result, dict) and 'error' in result:
-                return f"工具执行失败: {result['error']}"
-
-            # 记录调用
-            if self.tool_manager:
-                self.tool_manager.record_call(tool_name)
-
-            return f"工具执行成功: {json.dumps(result, ensure_ascii=False)}"
-        except Exception as e:
-            return f"工具执行失败: {str(e)}"
-
     def _infer_tool_name(self, user_query: str, context: str) -> Optional[str]:
         """从用户查询中推断目标工具名（意图识别不再提供tool_name时使用）"""
         if not self.llm_client or not self.mcp_manager:
             return None
 
-        tools_desc = self._get_tools_desc(brief=True)
+        # 工具名推断需要见到所有工具，不按意图过滤，但传入 query 供 tool_manager 做关键词过滤
+        tools_desc = self._get_tools_desc(brief=True, query=user_query)
         prompt = f"""根据用户请求，从工具列表中选择最匹配的工具。
 
 用户请求: {user_query}
@@ -1093,41 +909,39 @@ Action Input格式：
             self.logger.error(f"生成用户补充信息请求失败: {e}")
             return f"部分操作已完成，但在执行「{failed_step_desc}」时发现缺少必要信息。请补充相关参数后重试。\n错误详情: {failed_result[:200]}"
 
-    def _summarize_history(self, user_query, thoughts_actions):
-        """总结ReAct历史"""
-        history = self._format_react_history(thoughts_actions)
-        prompt = f"任务: {user_query}\n\n已执行的步骤:\n{history}\n\n请基于以上执行历史，为用户提供一个总结性的回答。"
-        try:
-            return self.llm_client.generate(prompt=prompt, temperature=0.5).strip()
-        except Exception as e:
-            return f"总结失败: {e}"
-
     # ================================================================
     # 辅助方法
     # ================================================================
-    def _get_tools_desc(self, brief=True, target_tool: str = None, query: str = ""):
+    def _get_tools_desc(self, brief=True, target_tool: str = None, query: str = "",
+                        intent_type: str = None):
         """获取可用工具列表描述
 
         懒加载策略：
         - brief=True（默认）：仅返回名称+描述，用于工具选择阶段，节省上下文token
         - brief=False：包含完整Input Schema，仅在需要填充参数时使用
         - target_tool：指定需要加载完整 schema 的工具名
-        - query：用户查询，用于关键词/分类过滤（仅 tool_manager 可用时生效）
+        - query：用户查询，用于关键词/分类过滤
+        - intent_type：意图类型，用于按阶段过滤（避免导购阶段出现下单工具）
 
         当 tool_manager 可用时，通过多层过滤（关键词→频率→top_k）缩小候选集；
-        否则回退到直接从 mcp_manager 获取全量工具。
+        否则回退到直接从 mcp_manager 获取，并按意图类型过滤。
         """
         # 优先使用 tool_manager（多层过滤 + 本地工具支持）
         if self.tool_manager:
             return self.tool_manager.get_tools_desc(query=query, target_tool=target_tool)
 
-        # 回退：直接从 mcp_manager 获取
+        # 回退：直接从 mcp_manager 获取，按意图类型过滤
         desc = ["1. search_knowledge - 从知识库中搜索相关信息"]
         if not brief:
             desc.append('   参数: {"query": "搜索关键词"}')
         idx = 2
         if self.mcp_manager:
-            mcp_tools = self.mcp_manager.get_available_tools(use_cache=True)
+            if intent_type:
+                mcp_tools = self.mcp_manager.get_tools_for_context(
+                    intent_type=intent_type, query=query
+                )
+            else:
+                mcp_tools = self.mcp_manager.get_available_tools(use_cache=True)
             for tool in mcp_tools:
                 name = tool.get('name', '未知工具')
                 d = tool.get('description', '无描述')
@@ -1144,259 +958,6 @@ Action Input格式：
         if not brief:
             desc.append('   参数: {"answer": "最终答案内容"}')
         return "\n".join(desc)
-
-    def _find_tool_server(self, tool_name):
-        """查找工具所属的服务器"""
-        if self.tool_manager:
-            return self.tool_manager.find_tool_server(tool_name)
-        if not self.mcp_manager:
-            return None
-        for tool in self.mcp_manager.get_available_tools(use_cache=True):
-            if tool['name'] == tool_name:
-                return tool.get('server')
-        servers = self.mcp_manager.get_enabled_servers()
-        if servers:
-            return servers[0].get('name') if isinstance(servers, list) else list(servers.keys())[0]
-        return None
-
-    def _get_tool_schema(self, tool_name):
-        """获取工具的输入schema"""
-        if self.tool_manager:
-            return self.tool_manager.get_tool_schema(tool_name)
-        if not self.mcp_manager:
-            return None
-        for tool in self.mcp_manager.get_available_tools(use_cache=True):
-            if tool['name'] == tool_name:
-                return tool.get('inputSchema', {})
-        return None
-
-    @staticmethod
-    def _compress_schema(schema: dict) -> dict:
-        """压缩JSON Schema，减少上下文窗口占用
-
-        主要优化：
-        1. anyOf[{type:X},{type:null}] → {type:X, optional:true}（Pydantic Optional模式）
-        2. 移除 additionalProperties、title 等对参数提取无用的字段
-        3. 保留 description、default、enum 等语义信息
-        """
-        if not isinstance(schema, dict):
-            return schema
-
-        result = {}
-        for key, value in schema.items():
-            # 跳过对参数提取无用的元数据字段
-            if key in ('additionalProperties', 'title', '$defs'):
-                continue
-
-            if key == 'properties' and isinstance(value, dict):
-                result[key] = {
-                    pname: TaskPlanner._compress_property(pschema)
-                    for pname, pschema in value.items()
-                }
-            else:
-                result[key] = value
-
-        return result
-
-    @staticmethod
-    def _compress_property(prop: dict) -> dict:
-        """压缩单个属性的schema"""
-        if not isinstance(prop, dict):
-            return prop
-
-        # 处理 anyOf: [{type:X}, {type:null}] → {type:X, optional:true}
-        if 'anyOf' in prop:
-            non_null = [s for s in prop['anyOf'] if s.get('type') != 'null']
-            if len(non_null) == 1:
-                compressed = dict(non_null[0])
-                compressed['optional'] = True
-                # 保留外层的 default、description
-                if 'default' in prop:
-                    compressed['default'] = prop['default']
-                if 'description' in prop:
-                    compressed['description'] = prop['description']
-                return compressed
-
-        # 递归处理嵌套对象
-        if prop.get('type') == 'object' and 'properties' in prop:
-            result = dict(prop)
-            result['properties'] = {
-                k: TaskPlanner._compress_property(v)
-                for k, v in prop['properties'].items()
-            }
-            result.pop('additionalProperties', None)
-            result.pop('title', None)
-            return result
-
-        # 移除无用字段
-        result = {k: v for k, v in prop.items() if k not in ('title',)}
-        return result
-
-    def _format_react_history(self, thoughts_actions):
-        """格式化ReAct历史"""
-        if not thoughts_actions:
-            return ""
-        lines = []
-        for i, step in enumerate(thoughts_actions, 1):
-            lines.append(f"步骤 {i}:")
-            lines.append(f"  思考: {step['thought']}")
-            lines.append(f"  行动: {step['action']}")
-            lines.append(f"  输入: {step['action_input']}")
-            if 'observation' in step:
-                obs = step['observation']
-                if len(obs) > 800:
-                    obs = obs[:800] + "...(已截断)"
-                lines.append(f"  观察: {obs}")
-        return "\n".join(lines)
-
-    def _parse_react_response(self, response):
-        """解析ReAct响应
-
-        支持两种 LLM 输出格式：
-        1. 标准文本格式:
-           Thought: ...
-           Action: ...
-           Action Input: {...}
-        2. JSON 格式（LLM 有时会输出单行 JSON）:
-           {"Thought": "...", "Action": "...", "Action Input": {...}}
-        """
-        lines = response.strip().split('\n')
-        current_section = None
-        content_lines = []
-        sections = {}
-        for line in lines:
-            line = line.strip()
-            if line.startswith('Thought:'):
-                if current_section and content_lines:
-                    sections[current_section] = ' '.join(content_lines).strip()
-                current_section = 'thought'
-                content_lines = [line[len('Thought:'):].strip()]
-            elif line.startswith('Action Input:'):
-                if current_section and content_lines:
-                    sections[current_section] = ' '.join(content_lines).strip()
-                current_section = 'action_input'
-                content_lines = [line[len('Action Input:'):].strip()]
-            elif line.startswith('Action:'):
-                if current_section and content_lines:
-                    sections[current_section] = ' '.join(content_lines).strip()
-                current_section = 'action'
-                content_lines = [line[len('Action:'):].strip()]
-            elif line and current_section:
-                content_lines.append(line)
-        if current_section and content_lines:
-            sections[current_section] = ' '.join(content_lines).strip()
-
-        # 如果标准格式未解析到结果，尝试 JSON 格式解析
-        if not sections.get('action'):
-            sections = self._try_parse_json_react(response, sections)
-
-        thought = sections.get('thought', '')
-        action = sections.get('action', '').strip()
-        action_input_str = sections.get('action_input', '{}')
-
-        # 如果 action_input 已经是 dict（从 JSON 解析得到），直接使用
-        if isinstance(action_input_str, dict):
-            action_input = action_input_str
-        else:
-            action_input = self._parse_action_input(action_input_str)
-
-        # LLM 有时直接把工具名作为 Action（如 "get_user_detail"）
-        # 而非规定的 "call_mcp_tool"，这里自动修正
-        valid_actions = {'search_knowledge', 'call_mcp_tool', 'finish'}
-        if action not in valid_actions and action:
-            # 检查是否是一个已知的 MCP 工具名
-            if self.mcp_manager:
-                try:
-                    known_tools = {t['name'] for t in self.mcp_manager.get_available_tools(use_cache=True)}
-                    if action in known_tools:
-                        self.logger.info(f"[ReAct] 自动修正 Action: '{action}' → 'call_mcp_tool'")
-                        # 把工具名放入 action_input
-                        if 'tool_name' not in action_input:
-                            action_input = {'tool_name': action, 'parameters': action_input}
-                        action = 'call_mcp_tool'
-                except Exception:
-                    pass
-
-        return thought, action, action_input
-
-    def _try_parse_json_react(self, response, existing_sections):
-        """尝试将 LLM 响应解析为 JSON 格式的 ReAct 输出
-
-        处理 LLM 返回如下格式的情况：
-        {"Thought": "...", "Action": "...", "Action Input": {...}}
-        """
-        text = response.strip()
-        # 尝试提取第一个完整的 JSON 对象
-        try:
-            obj = json.loads(text)
-        except json.JSONDecodeError:
-            m = re.search(r'\{.*\}', text, re.DOTALL)
-            if not m:
-                return existing_sections
-            try:
-                obj = json.loads(m.group())
-            except json.JSONDecodeError:
-                return existing_sections
-
-        if not isinstance(obj, dict):
-            return existing_sections
-
-        # 支持大小写和多种 key 名
-        key_map = {
-            'thought': 'thought', 'Thought': 'thought',
-            'action': 'action', 'Action': 'action',
-            'action_input': 'action_input', 'Action Input': 'action_input',
-            'Action_Input': 'action_input', 'actionInput': 'action_input',
-        }
-
-        sections = dict(existing_sections)
-        for raw_key, norm_key in key_map.items():
-            if raw_key in obj and obj[raw_key]:
-                sections[norm_key] = obj[raw_key]
-
-        # 处理 LLM 将 answer 直接放在顶层的情况：
-        # {"action": "finish", "answer": "..."} → action_input = {"answer": "..."}
-        if sections.get('action') == 'finish' and 'action_input' not in sections:
-            answer = obj.get('answer') or obj.get('Answer', '')
-            if answer:
-                sections['action_input'] = {'answer': answer}
-
-        if sections.get('action'):
-            self.logger.info(f"[ReAct] 使用 JSON 格式解析成功: action={sections.get('action')}")
-        return sections
-
-    @staticmethod
-    def _parse_action_input(action_input_str):
-        """解析 action_input 字符串为 dict"""
-        cleaned = action_input_str.strip()
-        # 清理 markdown 代码块包裹
-        if cleaned.startswith('```'):
-            parts = cleaned.split('```')
-            inner = parts[1] if len(parts) >= 2 else cleaned
-            if inner.startswith('json'):
-                inner = inner[4:]
-            cleaned = inner.strip()
-
-        try:
-            return json.loads(cleaned)
-        except json.JSONDecodeError:
-            # 尝试提取第一个平衡的 {...} JSON 块（非贪婪）
-            # 使用平衡括号匹配，避免贪婪匹配跨越多个 JSON 对象
-            depth = 0
-            start = -1
-            for i, ch in enumerate(cleaned):
-                if ch == '{':
-                    if depth == 0:
-                        start = i
-                    depth += 1
-                elif ch == '}':
-                    depth -= 1
-                    if depth == 0 and start >= 0:
-                        try:
-                            return json.loads(cleaned[start:i + 1])
-                        except json.JSONDecodeError:
-                            break
-            return {'raw': action_input_str}
 
     def _format_param_info(self, param_name, param_schema, indent=0):
         """递归格式化参数信息"""
@@ -1422,27 +983,6 @@ Action Input格式：
                 rm = " ⚠️" if sn in sub_req else ""
                 lines.extend(self._format_param_info(f"{sn}{rm}", ss, indent + 1))
         return lines
-
-    @staticmethod
-    def _is_duplicate_action(action, action_input, previous_steps):
-        """检测当前动作是否与之前已成功执行的步骤重复"""
-        for prev in previous_steps:
-            if prev.get('action') != action:
-                continue
-            # 检查观察结果是否表明成功
-            obs = prev.get('observation', '')
-            if '成功' not in obs and '完成' not in obs:
-                continue
-            # 比较action_input是否相同
-            prev_input = prev.get('action_input', {})
-            if action == 'call_mcp_tool':
-                if (prev_input.get('tool_name') == action_input.get('tool_name')
-                        and prev_input.get('parameters') == action_input.get('parameters')):
-                    return True
-            elif action == 'search_knowledge':
-                if prev_input.get('query') == action_input.get('query'):
-                    return True
-        return False
 
     @staticmethod
     def _sanitize_feedback(message: str, suggestions: list) -> str:

@@ -207,6 +207,22 @@ async def resume_session(session_id: str, req: SessionActionRequest):
     return {"success": True, "session_id": session_id}
 
 
+class UpdateTitleRequest(BaseModel):
+    user_id: str
+    title: str
+
+
+@app.put("/api/sessions/{session_id}/title")
+async def update_session_title(session_id: str, req: UpdateTitleRequest):
+    """更新会话标题"""
+    agent = _get_agent(req.user_id)
+    if not agent:
+        raise HTTPException(status_code=401, detail="请先登录")
+
+    agent.session_manager.update_session_title(session_id, req.title)
+    return {"success": True}
+
+
 @app.delete("/api/sessions/{session_id}")
 async def delete_session(session_id: str, user_id: str):
     """删除单个会话"""
@@ -237,7 +253,9 @@ async def get_history(session_id: str, user_id: str, last_n: int = 50):
         raise HTTPException(status_code=401, detail="请先登录")
 
     messages = agent.session_manager.get_messages(session_id, last_n=last_n)
+    session_info = agent.session_manager.get_session(session_id)
     return {
+        "title": session_info.title if session_info else "新对话",
         "messages": [
             {"role": m["role"], "content": m["content"]}
             for m in messages

@@ -1,0 +1,321 @@
+[
+  {
+    "product_id": "P001",
+    "product_name": "iPhone 15 Pro Max",
+    "category": "手机",
+    "brand": "Apple",
+    "price": 9999.0,
+    "documents": [
+      {
+        "type": "detail",
+        "title": "iPhone 15 Pro Max 详细评测",
+        "content": "iPhone 15 Pro Max 是 Apple 2023 年度旗舰，搭载全新 A17 Pro 芯片（3nm制程），首次采用钛金属中框，整机重量降至 221g。屏幕为 6.7 英寸 Super Retina XDR OLED，峰值亮度高达 2000nit，支持 ProMotion 120Hz 自适应刷新率和全天候显示。主摄升级至 4800 万像素 f/1.78 光圈，配合 5 倍光学变焦长焦镜头（等效120mm），可实现从 0.5x 超广角到 25x 数码变焦的全焦段覆盖。首次全系标配 USB-C 接口，支持 USB 3 传输速率（最高 10Gbps）。电池续航方面，视频播放最长可达 29 小时。支持卫星紧急求助 SOS 和车祸检测功能。"
+      },
+      {
+        "type": "scenario",
+        "title": "iPhone 15 Pro Max 适用场景",
+        "content": "iPhone 15 Pro Max 适合以下人群：1）摄影爱好者——4800万像素主摄 + 5倍光学变焦，可拍摄专业级人像和远景；2）视频创作者——支持 4K 60fps ProRes 视频直录到外置SSD，A17 Pro 的光线追踪引擎可运行主机级游戏；3）商务人士——钛金属机身质感高端、续航持久、支持eSIM双卡；4）苹果生态用户——与 Mac、iPad、AirPods、Apple Watch 无缝协同（隔空投送、接力、通用剪贴板）。不推荐人群：预算有限的用户（可考虑 P003 小米14 Ultra 作为替代）、对iOS生态不感兴趣的用户。"
+      },
+      {
+        "type": "faq",
+        "title": "iPhone 15 Pro Max 常见问题",
+        "content": "Q: iPhone 15 Pro Max 和 iPhone 15 Pro 有什么区别？\nA: Pro Max 的屏幕更大（6.7 vs 6.1英寸）、续航更长（29h vs 23h 视频播放）、长焦从3倍升级为5倍光学变焦。其他配置（芯片、主摄、内存）完全相同。\n\nQ: 钛金属边框容易刮花吗？\nA: 钛金属硬度高于不锈钢，日常使用不易刮花，但建议搭配保护壳使用。\n\nQ: 支持快充吗？\nA: 支持 USB-C PD 快充，使用 20W 及以上充电器约 30 分钟可充至 50%。也支持 MagSafe 15W 无线充电。"
+      }
+    ]
+  },
+  {
+    "product_id": "P002",
+    "product_name": "华为Mate 60 Pro",
+    "category": "手机",
+    "brand": "华为",
+    "price": 6999.0,
+    "documents": [
+      {
+        "type": "detail",
+        "title": "华为Mate 60 Pro 详细评测",
+        "content": "华为Mate 60 Pro 搭载麒麟9000S芯片，采用自研架构，性能表现均衡。6.82英寸LTPO OLED曲面屏，分辨率2720x1260，支持1-120Hz自适应刷新率。后置三摄系统：5000万像素XMAGE超光变主摄（f/1.4-f/4.0可变光圈）、1200万像素超广角、4800万像素潜望式长焦（支持最高100倍变焦）。正面采用超可靠昆仑玻璃面板，整机支持IP68防尘防水。全球首款支持天通卫星通话功能（不依赖地面网络即可双向通话），同时支持北斗卫星消息。搭载鸿蒙HarmonyOS 4.0系统，多设备协同体验出色。电池5000mAh，支持88W有线快充和50W无线快充。"
+      },
+      {
+        "type": "scenario",
+        "title": "华为Mate 60 Pro 适用场景",
+        "content": "华为Mate 60 Pro 适合以下人群：1）华为生态用户——与华为笔记本、平板、手表、耳机深度协同（超级终端一拉即合）；2）商务人士——XMAGE影像系统出片质量高，昆仑玻璃面板耐摔，卫星通话功能在野外/地下室等无信号场景下是安全保障；3）注重隐私安全的用户——鸿蒙系统纯净模式可有效控制应用权限；4）户外运动爱好者——IP68防水+卫星通信。与iPhone 15 Pro Max(P001)相比，价格更亲民（￥6999 vs ￥9999），影像系统各有特色，生态选择是关键差异。"
+      },
+      {
+        "type": "faq",
+        "title": "华为Mate 60 Pro 常见问题",
+        "content": "Q: 华为Mate 60 Pro支持5G吗？\nA: 支持高速网络连接，官方未公布具体频段信息。\n\nQ: 卫星通话需要额外付费吗？\nA: 卫星通话功能已内置，但使用天通卫星通话服务需要开通对应运营商套餐。北斗卫星消息为免费功能。\n\nQ: 鸿蒙系统能用安卓应用吗？\nA: 鸿蒙系统兼容绝大部分安卓应用，主流应用均已适配鸿蒙原生版本。"
+      }
+    ]
+  },
+  {
+    "product_id": "P003",
+    "product_name": "小米14 Ultra",
+    "category": "手机",
+    "brand": "小米",
+    "price": 5999.0,
+    "documents": [
+      {
+        "type": "detail",
+        "title": "小米14 Ultra 详细评测",
+        "content": "小米14 Ultra 是小米与徕卡深度合作的影像旗舰。搭载骁龙8 Gen3处理器，配备LPDDR5X内存和UFS 4.0存储，性能第一梯队。6.73英寸华星C8屏幕，2K分辨率，峰值亮度3000nit，护眼等级达到SGS五星。后置四摄系统全部为5000万像素：主摄采用1英寸光影猎人900传感器+徕卡Summilux f/1.63光圈镜头，支持无级可变光圈（f/1.63-f/4.0）；超广角12mm f/1.8；两颗长焦分别为75mm和120mm。随机附赠摄影手柄套件，拍照体验堪比专业相机。电池5300mAh，支持90W有线快充和75W无线快充。整机支持IP68防水。"
+      },
+      {
+        "type": "scenario",
+        "title": "小米14 Ultra 适用场景",
+        "content": "小米14 Ultra 适合以下人群：1）手机摄影发烧友——徕卡四摄是当前手机影像的天花板之一，配合摄影手柄操控感极佳；2）追求性价比的旗舰用户——相比 P001 iPhone 15 Pro Max(￥9999)和 P002 华为Mate 60 Pro(￥6999)，小米14 Ultra(￥5999)价格最低但影像配置最强；3）安卓发烧友——骁龙8 Gen3+小米澎湃OS流畅度高。与同价位相比，小米14 Ultra 的影像能力是最大卖点。如果不太在意拍照，可以考虑更便宜的机型。"
+      }
+    ]
+  },
+  {
+    "product_id": "P004",
+    "product_name": "MacBook Pro 16寸",
+    "category": "笔记本电脑",
+    "brand": "Apple",
+    "price": 19999.0,
+    "documents": [
+      {
+        "type": "detail",
+        "title": "MacBook Pro 16寸 详细评测",
+        "content": "MacBook Pro 16英寸搭载Apple M3 Max芯片（16核CPU+40核GPU），统一内存最高128GB，是苹果目前性能最强的笔记本。16.2英寸Liquid Retina XDR显示屏，分辨率3456x2234，峰值亮度1600nit（HDR），支持ProMotion 120Hz自适应刷新率。续航方面，正常使用可达22小时视频播放，是同级别性能笔记本中续航最长的。配备3个雷雳4/USB-C端口、HDMI 2.1、SDXC卡槽、MagSafe 3充电口和3.5mm耳机孔。六扬声器音响系统支持空间音频。搭载macOS系统，原生支持Final Cut Pro、Logic Pro等专业创作工具。"
+      },
+      {
+        "type": "scenario",
+        "title": "MacBook Pro 16寸 适用场景",
+        "content": "MacBook Pro 16寸适合以下人群：1）专业视频剪辑师——M3 Max可流畅剪辑8K ProRes视频，多轨时间线不卡顿；2）3D设计师/开发者——40核GPU可运行Blender、Unity等专业软件；3）音乐制作人——六扬声器+低噪音风扇设计非常适合录音和混音；4）需要长续航的出差族——22小时续航可覆盖跨洋航班全程。注意：如果只是日常办公和轻度创作，MacBook Pro 16寸性能过剩、价格偏高（￥19999），推荐 P005 ThinkPad X1 Carbon(￥12999) 或 P006 华为MateBook X Pro(￥11999)。"
+      }
+    ]
+  },
+  {
+    "product_id": "P005",
+    "product_name": "联想ThinkPad X1 Carbon",
+    "category": "笔记本电脑",
+    "brand": "联想",
+    "price": 12999.0,
+    "documents": [
+      {
+        "type": "detail",
+        "title": "ThinkPad X1 Carbon 详细评测",
+        "content": "联想ThinkPad X1 Carbon 是经典商务轻薄本的标杆产品。14英寸2.8K OLED屏幕（2880x1800），100% DCI-P3色域，DisplayHDR True Black 500认证。机身采用碳纤维+镁铝合金材质，重量仅1.12kg，厚度15.36mm。通过MIL-STD-810H军标认证（12项测试，包括跌落、振动、极端温度等）。搭载Intel Core Ultra处理器（Intel Evo平台认证），支持指纹识别+红外人脸解锁双重生物识别。键盘手感延续ThinkPad传统的出色体验，1.5mm键程，带键盘背光。接口丰富：2个雷雳4、2个USB-A、HDMI 2.1、3.5mm音频。续航约15小时。"
+      },
+      {
+        "type": "scenario",
+        "title": "ThinkPad X1 Carbon 适用场景",
+        "content": "ThinkPad X1 Carbon 适合以下人群：1）商务人士——军标认证耐用性强，指纹+人脸双解锁安全高效，键盘手感是Windows阵营最佳；2）频繁出差者——1.12kg极致轻便，续航15小时，接口齐全无需转接；3）企业IT采购——ThinkPad是企业市场占有率最高的品牌，IT管理和售后服务完善。与 P006 华为MateBook X Pro(￥11999)相比，X1 Carbon 键盘手感更好、接口更全、军标认证更可靠；MateBook X Pro 则在屏幕触控、华为生态协同方面有优势。"
+      }
+    ]
+  },
+  {
+    "product_id": "P006",
+    "product_name": "华为MateBook X Pro",
+    "category": "笔记本电脑",
+    "brand": "华为",
+    "price": 11999.0,
+    "documents": [
+      {
+        "type": "detail",
+        "title": "华为MateBook X Pro 详细评测",
+        "content": "华为MateBook X Pro 是华为旗舰轻薄本，主打高端商务和跨设备协同。14.2英寸3.1K实色屏（3120x2080），触控屏支持十点触控，10.7亿色显示，P3色域覆盖。金属一体成型机身，重约1.26kg。搭载Intel Core Ultra处理器，配备16GB/32GB LPDDR5x内存。最大亮点是超级终端功能——与华为手机、平板一拉即合，可将手机屏幕直接投射到笔记本上操作，拖拽传文件延迟极低。6扬声器立体声系统，音质出色。接口为2个全功能USB-C（雷雳4）+1个USB-C+3.5mm音频。续航约13小时。"
+      },
+      {
+        "type": "scenario",
+        "title": "华为MateBook X Pro 适用场景",
+        "content": "华为MateBook X Pro 适合以下人群：1）华为手机/平板用户——超级终端跨设备协同体验是独家优势，工作效率大幅提升；2）注重屏幕品质的创作者——3.1K触控屏色彩准确，适合修图和设计；3）追求金属质感的用户——一体成型工艺美观高端。价格￥11999，在三款笔记本中最亲民。如果不在华为生态内，且更看重键盘手感和耐用性，推荐 P005 ThinkPad X1 Carbon。"
+      }
+    ]
+  },
+  {
+    "product_id": "P007",
+    "product_name": "索尼WH-1000XM5",
+    "category": "耳机",
+    "brand": "索尼",
+    "price": 2499.0,
+    "documents": [
+      {
+        "type": "detail",
+        "title": "索尼WH-1000XM5 详细评测",
+        "content": "索尼WH-1000XM5 是索尼旗舰头戴式降噪耳机，搭载集成处理器V1+QN1双芯片，8个麦克风实现行业顶级主动降噪。30mm驱动单元经过全新设计，频率响应4Hz-40000Hz，支持LDAC高解析度蓝牙编码。自适应降噪模式可根据环境自动调节降噪等级（飞机/办公室/户外等场景自动切换）。佩戴舒适度优秀，头梁采用柔软合成皮革，耳罩采用超柔软聚氨酯。支持同时连接两台设备（多点连接），可在手机和电脑之间无缝切换。续航30小时（开启降噪），快充3分钟可使用3小时。折叠设计便于携带。"
+      },
+      {
+        "type": "faq",
+        "title": "索尼WH-1000XM5 常见问题",
+        "content": "Q: WH-1000XM5和AirPods Pro 2(P008)怎么选？\nA: 两者定位不同——XM5是头戴式（降噪更强、音质更好、续航更长），AirPods Pro 2是入耳式（更便携、更适合运动、苹果生态无缝连接）。如果主要在办公室/通勤使用且追求音质，选XM5；如果追求便携性且用iPhone，选AirPods Pro 2。\n\nQ: 降噪效果和Bose QC Ultra相比如何？\nA: 两者降噪水平旗鼓相当，XM5在中高频降噪略强（人声过滤好），Bose在低频降噪略强（引擎声过滤好）。音质方面XM5更通透自然。\n\nQ: 戴眼镜会漏音吗？\nA: XM5的超柔软耳罩对眼镜腿的密封性很好，漏音极少。"
+      }
+    ]
+  },
+  {
+    "product_id": "P008",
+    "product_name": "AirPods Pro 2",
+    "category": "耳机",
+    "brand": "Apple",
+    "price": 1899.0,
+    "documents": [
+      {
+        "type": "detail",
+        "title": "AirPods Pro 2 详细评测",
+        "content": "AirPods Pro 2 搭载Apple H2芯片，主动降噪能力相比上代提升2倍。自适应通透模式可自动降低刺耳的环境噪音（如施工声、警笛声），同时保留人声对话。个性化空间音频利用iPhone TrueDepth相机扫描耳型，定制3D音频效果。新增USB-C充电盒，支持扬声器发声（可通过「查找」功能定位充电盒），底部扬声器还支持对讲机功能。续航6小时（开启降噪），搭配充电盒共30小时。IP54防尘防水认证，适合运动场景。支持触控手势控制和头部转动检测（来电时转头即可接听）。"
+      },
+      {
+        "type": "scenario",
+        "title": "AirPods Pro 2 适用场景",
+        "content": "AirPods Pro 2 适合以下人群：1）iPhone用户——无缝连接体验无可替代（开盖即配对、设备间自动切换、查找功能）；2）运动爱好者——IP54防水+入耳式设计，跑步/健身时不易掉落；3）通勤族——降噪强度足够应对地铁/公交噪音；4）对便携性要求高的用户——充电盒体积小巧，可以放进小口袋。如果追求更极致的降噪和音质，且不介意头戴式体积，推荐 P007 索尼WH-1000XM5（￥2499）。"
+      }
+    ]
+  },
+  {
+    "product_id": "P009",
+    "product_name": "iPad Air 5",
+    "category": "平板电脑",
+    "brand": "Apple",
+    "price": 4799.0,
+    "documents": [
+      {
+        "type": "detail",
+        "title": "iPad Air 5 详细评测",
+        "content": "iPad Air 5 搭载Apple M1芯片（与MacBook Air同款），性能远超同价位平板。10.9英寸Liquid Retina屏幕，2360x1640分辨率，P3广色域，500nit亮度，支持True Tone原彩显示。支持Apple Pencil 2代和妙控键盘，是平板生产力的标杆。前置1200万像素超广角镜头支持Center Stage人物居中功能，视频会议时自动跟踪人物。搭载iPadOS系统，支持台前调度多任务功能。WiFi 6和可选5G蜂窝版本。接口为USB-C（USB 3.1 Gen 2，10Gbps）。续航约10小时。"
+      },
+      {
+        "type": "scenario",
+        "title": "iPad Air 5 适用场景",
+        "content": "iPad Air 5 适合以下人群：1）大学生——Apple Pencil 2代记笔记体验极佳，M1芯片运行专业APP不卡顿；2）轻度创作者——搭配妙控键盘可做轻量级文档编辑和图片处理；3）娱乐用户——10.9英寸屏幕观影/游戏体验好。与 P010 华为MatePad Pro 13.2（￥5699）相比，iPad Air 5更便宜、APP生态更成熟；MatePad Pro屏幕更大（13.2英寸）、鸿蒙生态与华为手机协同好。选择取决于你的手机生态。"
+      }
+    ]
+  },
+  {
+    "product_id": "P010",
+    "product_name": "华为MatePad Pro 13.2",
+    "category": "平板电脑",
+    "brand": "华为",
+    "price": 5699.0,
+    "documents": [
+      {
+        "type": "detail",
+        "title": "华为MatePad Pro 13.2 详细评测",
+        "content": "华为MatePad Pro 13.2 采用13.2英寸OLED柔性屏，分辨率2880x1920，高达144Hz刷新率。屏幕采用超窄边框设计，屏占比高达92%。支持星闪连接技术（华为自研近距离无线连接协议，延迟比蓝牙低60%），M-Pencil 3代书写延迟低至2ms，接近纸笔体验。搭载鸿蒙HarmonyOS 4.0，支持PC级应用（如WPS桌面版、CAJViewer等），多窗口多任务操作流畅。超级终端一拉即合，可与华为手机、笔记本无缝协同。6扬声器+4麦克风，支持华为自有的音频空间音效。电池10100mAh，支持88W超级快充。"
+      },
+      {
+        "type": "scenario",
+        "title": "华为MatePad Pro 13.2 适用场景",
+        "content": "华为MatePad Pro 13.2 适合以下人群：1）华为全家桶用户——与华为手机、笔记本协同无缝（一拉即合、多屏协同）；2）需要大屏生产力的用户——13.2英寸大屏+PC级应用，接近笔记本的办公体验；3）学生和笔记爱好者——M-Pencil 3代+星闪低延迟，手写体验目前安卓/鸿蒙平板中最佳。价格￥5699，比iPad Air 5(P009 ￥4799)贵900元但屏幕大3英寸且支持华为生态。"
+      }
+    ]
+  },
+  {
+    "product_id": "P011",
+    "product_name": "戴森V15吸尘器",
+    "category": "家电",
+    "brand": "戴森",
+    "price": 4990.0,
+    "documents": [
+      {
+        "type": "detail",
+        "title": "戴森V15 Detect 详细评测",
+        "content": "戴森V15 Detect 是戴森旗舰无绳吸尘器，最大亮点是激光灰尘探测技术——吸头内置绿色激光，可照亮地板上肉眼看不见的微尘，让清洁效果一目了然。搭载Dyson Hyperdymium马达，转速高达125000rpm，提供240AW强劲吸力。压电式声学传感器可实时检测并分类灰尘颗粒大小和数量，显示在LCD屏幕上。整机HEPA过滤系统，可捕获99.97%小至0.1微米的颗粒物。配备多种吸头（软绒滚筒、防缠绕吸头、缝隙吸头等）。续航最长60分钟（节能模式），充电约4.5小时。整机可拆卸清洗。"
+      },
+      {
+        "type": "faq",
+        "title": "戴森V15 常见问题",
+        "content": "Q: 戴森V15 和普通吸尘器有什么区别？\nA: 核心区别在于激光探测（看得见灰尘）、智能灰尘感应（自动调节吸力）、HEPA过滤（过敏患者友好）。普通吸尘器无法提供这些智能化体验。\n\nQ: 60分钟续航够用吗？\nA: 60分钟是节能模式下的续航，适合100-150平米的日常清洁。如果经常使用强力模式（续航约8分钟），建议分区域清洁。\n\nQ: 和海尔冰箱(P012)一起买有优惠吗？\nA: 可以咨询客服了解家电套购优惠。戴森V15(￥4990)+海尔冰箱BCD-500(￥3299)组合是家庭新居必备。"
+      }
+    ]
+  },
+  {
+    "product_id": "P012",
+    "product_name": "海尔冰箱BCD-500",
+    "category": "家电",
+    "brand": "海尔",
+    "price": 3299.0,
+    "documents": [
+      {
+        "type": "detail",
+        "title": "海尔冰箱BCD-500 详细评测",
+        "content": "海尔BCD-500 是500升大容量对开门冰箱，适合3-5口之家使用。风冷无霜技术，告别手动除霜的烦恼。DEO净味模块可主动去除冰箱异味，保持食材新鲜。一级能效认证，日耗电量仅0.86度，年电费约300元。变频压缩机运行噪音低（仅38dB），运行更安静。冷藏室+冷冻室独立双循环，互不串味。内部LED照明均匀，多层搁架可灵活调节高度。外观为简约银灰色，宽度83cm，适合大部分厨房空间。全国联保，上门安装。"
+      },
+      {
+        "type": "scenario",
+        "title": "海尔冰箱BCD-500 适用场景",
+        "content": "海尔冰箱BCD-500 适合以下人群：1）新房装修家庭——500升大容量满足全家需求，一级能效省电省心；2）注重性价比的用户——￥3299在500升对开门冰箱中价格非常有竞争力；3）对噪音敏感的用户——变频压缩机38dB极低噪音。这是我们家电类目中最实惠的大件家电，搭配戴森V15吸尘器(P011 ￥4990)，新居家电一站搞定。"
+      }
+    ]
+  },
+  {
+    "product_id": "P013",
+    "product_name": "Nike Air Max 270",
+    "category": "运动鞋",
+    "brand": "Nike",
+    "price": 899.0,
+    "documents": [
+      {
+        "type": "detail",
+        "title": "Nike Air Max 270 详细评测",
+        "content": "Nike Air Max 270 以经典Air Max系列为基础，搭载Nike历史上最大的270度可视化Air气垫单元（高度32mm），提供极致缓震体验。鞋面采用双层网眼材质，兼顾透气性和支撑性。中底使用轻质泡棉搭配后掌超大Air气垫，步行和轻度跑步时脚感柔软回弹。橡胶外底耐磨防滑，适合日常通勤和休闲运动。多种配色可选（经典黑白、大学红、海军蓝等），百搭时尚。鞋身重量约290g（42码），属于轻量级。"
+      },
+      {
+        "type": "scenario",
+        "title": "Nike Air Max 270 适用场景",
+        "content": "Nike Air Max 270 适合以下人群：1）日常通勤和休闲穿搭——经典外观百搭，气垫舒适度高，长时间步行不累脚；2）学生群体——￥899价格亲民，配色丰富好搭配；3）轻度运动爱好者——适合日常慢跑、散步、健身房。注意：Air Max 270不适合专业长跑训练，如果需要专业跑步鞋，推荐 P014 Adidas Ultraboost(￥1299)，Boost缓震科技更适合高强度跑步。"
+      }
+    ]
+  },
+  {
+    "product_id": "P014",
+    "product_name": "Adidas Ultraboost",
+    "category": "运动鞋",
+    "brand": "Adidas",
+    "price": 1299.0,
+    "documents": [
+      {
+        "type": "detail",
+        "title": "Adidas Ultraboost 详细评测",
+        "content": "Adidas Ultraboost 是阿迪达斯标志性跑步鞋系列，搭载Boost中底缓震科技——数千颗TPU能量胶囊提供极致能量回馈，每一步都能感受到明显的回弹推进感。Primeknit编织鞋面如袜套般贴合脚型，透气且支撑力好。外底采用Continental马牌橡胶（与马牌轮胎同源技术），湿地抓地力出色，雨天跑步也不打滑。Linear Energy Push（LEP）抗扭转系统提供稳定支撑。Fitcounter模压后跟贴合跟腱形状，减少运动中的摩擦。适合中长距离跑步训练和日常穿搭。重量约310g（42码）。"
+      },
+      {
+        "type": "scenario",
+        "title": "Adidas Ultraboost 适用场景",
+        "content": "Adidas Ultraboost 适合以下人群：1）跑步爱好者——Boost缓震回弹性能出色，适合5-20公里的中距离训练；2）需要全天候使用的用户——马牌橡胶外底湿地不打滑；3）追求时尚运动风的用户——Ultraboost外观经典，可通勤可运动。与 P013 Nike Air Max 270(￥899)相比，Ultraboost 贵400元但跑步性能显著更强（Boost回弹 vs Air气垫缓震）。如果只是日常休闲穿搭，Air Max 270性价比更高。"
+      }
+    ]
+  },
+  {
+    "product_id": "P015",
+    "product_name": "Apple Watch Ultra 2",
+    "category": "智能手表",
+    "brand": "Apple",
+    "price": 6499.0,
+    "documents": [
+      {
+        "type": "detail",
+        "title": "Apple Watch Ultra 2 详细评测",
+        "content": "Apple Watch Ultra 2 是Apple面向极限运动和户外探险用户推出的旗舰智能手表。49mm钛金属表壳，蓝宝石水晶表镜，100米防水（满足休闲潜水需求）。搭载Apple S9芯片，双指互点手势操作。屏幕亮度最高3000nit，强光下也清晰可见。双频精密GPS（L1+L5）定位精度极高，适合越野跑和徒步导航。新增高海拔血氧监测和水温传感器。Action Button可自定义快捷操作（如开始运动、设置路标、打开手电筒）。86dB警笛功能可在紧急情况下吸引注意。续航36小时常规使用，低电量模式下最长72小时。支持watchOS系统全功能。"
+      },
+      {
+        "type": "scenario",
+        "title": "Apple Watch Ultra 2 适用场景",
+        "content": "Apple Watch Ultra 2 适合以下人群：1）户外运动爱好者——双频GPS精准导航、100米防水、36小时超长续航，是登山/越野跑/潜水的理想伴侣；2）iPhone用户的健康管家——血氧、心率、心电图、体温、睡眠全面监测；3）追求极致品质的用户——钛金属+蓝宝石的用料在智能手表中是天花板级别。价格￥6499偏高，如果只需要基础智能手表功能（通知、运动追踪），Apple Watch SE性价比更高（但我们暂未上架）。搭配 P001 iPhone 15 Pro Max 使用体验最佳。"
+      }
+    ]
+  },
+  {
+    "product_id": "CROSS_CATEGORY",
+    "product_name": "跨类目选购指南",
+    "category": "综合",
+    "brand": "平台",
+    "price": 0,
+    "documents": [
+      {
+        "type": "guide",
+        "title": "学生入学数码装备选购指南",
+        "content": "大学生入学必备数码装备推荐（按预算分档）：\n\n【1万预算】基础档\n- 手机：[P003] 小米14 Ultra ￥5999（性价比最高的影像旗舰）\n- 耳机：[P008] AirPods Pro 2 ￥1899（轻便降噪，图书馆必备）\n合计：约￥7,898\n\n【1.5万预算】进阶档\n- 手机：[P003] 小米14 Ultra ￥5999\n- 平板：[P009] iPad Air 5 ￥4799（上课记笔记神器）\n- 耳机：[P008] AirPods Pro 2 ￥1899\n合计：约￥12,697\n\n【2万预算】全能档\n- 笔记本：[P006] 华为MateBook X Pro ￥11999\n- 手机：[P003] 小米14 Ultra ￥5999\n- 耳机：[P008] AirPods Pro 2 ￥1899\n合计：约￥19,897\n\n【2.5万预算】旗舰档\n- 笔记本：[P005] ThinkPad X1 Carbon ￥12999\n- 手机：[P002] 华为Mate 60 Pro ￥6999\n- 耳机：[P007] 索尼WH-1000XM5 ￥2499\n合计：约￥22,497\n\n温馨提示：建议同品牌生态搭配（如华为手机+华为笔记本，iPhone+MacBook），跨设备协同体验更好。"
+      },
+      {
+        "type": "guide",
+        "title": "新居家电选购指南",
+        "content": "新居入住家电必备推荐：\n\n【基础款】\n- [P012] 海尔冰箱BCD-500 ￥3,299 —— 500升大容量对开门，一级能效省电\n合计：￥3,299\n\n【品质款】\n- [P012] 海尔冰箱BCD-500 ￥3,299\n- [P011] 戴森V15吸尘器 ￥4,990 —— 激光探测+HEPA过滤，过敏体质必备\n合计：￥8,289\n\n家电选购建议：冰箱是刚需，建议优先购买；吸尘器根据居住面积和清洁需求选择——如果家有宠物或过敏体质，强烈推荐戴森V15的HEPA过滤功能。"
+      },
+      {
+        "type": "guide",
+        "title": "运动装备选购指南",
+        "content": "运动装备选购推荐：\n\n【跑步爱好者】\n- 鞋：[P014] Adidas Ultraboost ￥1,299 —— Boost缓震专业跑步\n- 手表：[P015] Apple Watch Ultra 2 ￥6,499 —— 双频GPS精准配速\n- 耳机：[P008] AirPods Pro 2 ￥1,899 —— IP54防水运动不掉\n\n【日常健身】\n- 鞋：[P013] Nike Air Max 270 ￥899 —— 气垫舒适，通勤运动两用\n- 耳机：[P008] AirPods Pro 2 ￥1,899\n\n选鞋关键区别：Air Max 270 偏休闲舒适（适合走路、轻度跑步），Ultraboost 偏专业运动（适合中长跑训练）。两者不是同类竞品，根据使用场景选择。"
+      }
+    ]
+  }
+]

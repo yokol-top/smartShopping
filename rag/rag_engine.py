@@ -1,17 +1,19 @@
 import logging
 import os
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
+
 from observability import get_tracer
-from .vector_store import VectorStore
-from .embeddings import EmbeddingModel
-from .document_processor import DocumentProcessor
+from utils.llm_client import LLMClient
 from .document_loader import DocumentLoader
-from .query_rewriter import QueryRewriter, MultiQueryGenerator
-from .hyde import HyDE
+from .document_processor import DocumentProcessor
+from .embeddings import EmbeddingModel
 from .hybrid_retriever import HybridRetriever
+from .hyde import HyDE
+from .query_rewrite_router import QueryRewriteRouter
+from .query_rewriter import QueryRewriter, MultiQueryGenerator, CoRefResolver
 from .reranker import Reranker
 from .self_fix import SelfFix
-from utils.llm_client import LLMClient
+from .vector_store import VectorStore
 
 
 class RAGEngine:
@@ -60,24 +62,35 @@ class RAGEngine:
             logger=self.logger
         )
         
+        self.rag_config = config.get('rag', {})
+
         # 使用统一的LLM客户端初始化所有组件
         self.query_rewriter = QueryRewriter(llm_client=self.llm_client, logger=self.logger)
         self.multi_query_gen = MultiQueryGenerator(llm_client=self.llm_client, logger=self.logger)
         self.hyde = HyDE(llm_client=self.llm_client, logger=self.logger)
         self.reranker = Reranker(llm_client=self.llm_client, logger=self.logger)
+
+        # 查询重写路由器（4 级分流，替代原无条件重写）
+        self.coref_resolver = CoRefResolver(llm_client=self.llm_client, logger=self.logger)
+        self.rewrite_router = QueryRewriteRouter(
+            coref_resolver=self.coref_resolver,
+            semantic_rewriter=self.query_rewriter,
+            hyde=self.hyde,
+            multi_query_gen=self.multi_query_gen,
+            config=self.rag_config,
+            logger=self.logger,
+        )
         self.self_fix = SelfFix(
             llm_client=self.llm_client,
-            max_iterations=config.get('rag', {}).get('self_fix', {}).get('max_iterations', 2),
+            max_iterations=self.rag_config.get('self_fix', {}).get('max_iterations', 2),
             logger=self.logger
         )
-        
+
         self.hybrid_retriever = HybridRetriever(
-            vector_weight=config.get('rag', {}).get('hybrid_search', {}).get('vector_weight', 0.7),
-            bm25_weight=config.get('rag', {}).get('hybrid_search', {}).get('bm25_weight', 0.3),
+            vector_weight=self.rag_config.get('hybrid_search', {}).get('vector_weight', 0.7),
+            bm25_weight=self.rag_config.get('hybrid_search', {}).get('bm25_weight', 0.3),
             logger=self.logger
         )
-        
-        self.rag_config = config.get('rag', {})
         
         self.logger.info("RAG引擎初始化完成")
     
@@ -226,26 +239,19 @@ class RAGEngine:
 
         queries = [query]
 
-        if use_advanced:
-            # 查询重写
-            if self.rag_config.get('query_rewrite', {}).get('enabled', True):
-                rewritten_query = self.query_rewriter.rewrite_query(query, context)
-                if rewritten_query != query:
-                    queries.append(rewritten_query)
-                    self.logger.info(f"重写查询: {rewritten_query}")
-            
-            # 多查询生成
-            if self.rag_config.get('multi_query', {}).get('enabled', True):
-                num_queries = self.rag_config.get('multi_query', {}).get('num_queries', 3)
-                multi_queries = self.multi_query_gen.generate_queries(query, num_queries)
-                queries.extend(multi_queries)
-                self.logger.info(f"生成多查询: {multi_queries}")
-            
-            # HyDE
-            if self.rag_config.get('hyde', {}).get('enabled', True):
-                hypothetical_doc = self.hyde.generate_hypothetical_document(query)
-                queries.append(hypothetical_doc)
-                self.logger.info(f"生成假设性文档，长度: {len(hypothetical_doc)}")
+        if use_advanced and self.rag_config.get('query_rewrite', {}).get('enabled', True):
+            # 路由器决定走哪个重写层级（Level 0–3），每条查询只走一层
+            # use_deep=True 对应 rag_advanced intent，触发 Level 3（HyDE + 多查询）
+            rewrite_result = self.rewrite_router.route_and_rewrite(
+                query=query,
+                context=context,
+                use_deep=(use_advanced and self.rag_config.get('hyde', {}).get('enabled', True)),
+            )
+            queries = rewrite_result.queries
+            self.logger.info(
+                f"[RewriteRouter] level={rewrite_result.level.value} | "
+                f"reason={rewrite_result.reason} | queries={len(queries)}"
+            )
         
         # 去重
         queries = list(dict.fromkeys(queries))

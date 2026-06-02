@@ -27,7 +27,7 @@ llm:
 # 向量数据库配置 (Chroma)
 vectordb:
   type: "chroma"
-  persist_directory: "./data/chroma_db"
+  persist_directory: "../data/product_chroma_db"
   collection_name: "knowledge_base"
 
 # 嵌入模型配置 (支持 local、ollama、openai)
@@ -45,7 +45,7 @@ embedding:
   # - Local: "../../rag_app/bge-small-zh-v1.5" (本地 Sentence Transformers 模型路径)
   # - Ollama: "nomic-embed-text", "mxbai-embed-large"
   # - OpenAI: "text-embedding-3-small", "text-embedding-3-large"
-  model: "../model/bge-small-zh-v1.5"
+  model: "../data/model/bge-small-zh-v1.5"
   # bge-small-zh-v1.5支持的维度数最大是512，不同的模型维度不同
   dimension: 512
 
@@ -166,28 +166,29 @@ context_window:
 
 # 子Agent配置
 sub_agents:
-  enabled: true                    # 是否启用子Agent路由
-  presale:
-    init_product_kb: true          # 启动时是否自动初始化商品FAQ知识库
-  functional: {}                   # 功能处理子Agent（暂无额外配置）
+  enabled: true                    # 是否启用Orchestrator的子Agent委派能力
+  init_product_kb: true            # 启动时是否自动初始化商品FAQ知识库
 
-  # 子Agent上下文预算（字符数）
-  # 子Agent不需要主Agent那么大的上下文窗口，精简后更高效
-  context_budgets:
-    presale:
-      total: 4000                  # 售前子Agent总预算
-      task_brief: 500              # P1: 任务摘要（不可裁剪）
-      user_profile: 300            # P2: 用户画像
-      conv_context: 1200           # P3: 对话上下文（最近3轮）
-      domain_context: 1500         # P4: RAG/MCP领域数据
-      main_replies: 500            # P5: 主Agent补充信息
-    functional:
-      total: 4000                  # 功能子Agent总预算
-      task_brief: 500              # P1: 任务摘要
-      user_profile: 300            # P2: 用户画像
-      conv_context: 800            # P3: 对话上下文（功能操作不太依赖历史）
-      domain_context: 1800         # P4: 工具列表+参数schema
-      main_replies: 600            # P5: 主Agent补充（参数补全需要更多空间）
+# Orchestrator 编排器配置
+# 主Agent作为 执行者+指挥官+对话者 的三重角色
+# 复杂任务走5阶段生命周期：理解→规划→执行→整合→交付
+orchestrator:
+  # 委派决策参数
+  context_overflow_threshold: 0.75 # 上下文使用率超过此阈值时优先委派子Agent
+  parallel_threshold: 2            # 可并行子任务数 >= 此值时才创建子Agent
+  max_subtask_retries: 2           # 子Agent失败后最大重试次数
+
+  # 熔断器配置（企业级失败处理）
+  # 连续失败N次后暂停委派，冷却期后允许少量试探
+  circuit_breaker:
+    failure_threshold: 3           # 连续失败N次触发熔断
+    cooldown_seconds: 60           # 熔断后冷却期（秒）
+
+  # 动态子Agent默认配置
+  sub_agent_defaults:
+    timeout: 60                    # 子Agent执行超时（秒）
+    max_internal_retries: 1        # 子Agent内部工具调用重试次数
+    context_budget: 3000           # 子Agent上下文预算（字符数）
 
 # MCP服务配置
 mcp:
@@ -199,32 +200,31 @@ mcp:
 system_prompt:
   enabled: true
   content: |
-    你是一个智能AI助手，具备以下核心能力：
+    # 角色定义
+    你是智能购物助手，专门帮助用户发现、选择并购买最适合自己的商品。
     
-    1. **知识检索与问答**
-       - 可以从知识库中检索相关信息来回答问题
-       - 支持复杂查询的深度分析和多文档综合
-       - 在信息不足时会明确告知用户
+    # 能力边界
+    你可以：
+    - 根据用户需求搜索并推荐商品
+    - 查询用户的订单、地址、身份、商品信息
+    - 回答商品相关的售前问题
+    - 协助用户完成下单流程
     
-    2. **工具调用能力**
-       - 可以调用外部工具和服务来完成实际操作
-       - 能够自动识别用户意图并选择合适的工具
-       - 支持用户管理、订单处理等实际业务操作
+    你不可以：
+    - 在用户未明确确认前自动下单
+    - 访问其他用户的私人信息
+    - 承诺平台无法履行的服务
     
-    3. **对话管理**
-       - 理解并记住对话上下文，支持多轮对话
-       - 会定期总结重要信息形成长期记忆
-       - 能够根据对话历史提供连贯的回复
+    # 行为准则
+    1. 推荐商品时，必须说明推荐理由
+    2. 下单前必须向用户二次确认订单详情
+    3. 遇到不确定的商品信息，调用 RAG 工具，不要猜测
+    4. 如果用户需求模糊，先澄清再推荐
     
-    **交互原则：**
-    - 回答要准确、简洁、有条理
-    - 不确定时明确表达，不编造信息
-    - 区分知识库信息和通用知识，并注明来源
-    - 执行操作前会确认关键参数
-    - 保持友好、专业的沟通风格
-    
-    **当前会话上下文：**
-    你正在与用户进行多轮对话。请根据对话历史和用户的最新输入，提供最合适的回复。
+    # 回复风格
+    - 简洁友好，避免过度营销话术
+    - 推荐商品时最多列出 3 个，不要信息轰炸
+    - 使用中文回复
 
 # 可观测性配置 (OpenTelemetry)
 observability:
@@ -256,17 +256,25 @@ security:
   human_confirmation:
     enabled: true
     sensitive_operations:
+      # 高危操作（需二次确认）
       删除: "double"
       移除: "double"
       delete: "double"
       remove: "double"
       drop: "double"
+      退款: "double"
+      取消订单: "double"
+      # 购物操作（需确认）
+      下单: "confirm"
+      购买: "confirm"
       修改: "confirm"
       更新: "confirm"
       update: "confirm"
+      # 常规操作（仅通知）
       创建: "inform"
       添加: "inform"
       create: "inform"
+      查询: "inform"
   permissions:
     enabled: true
     default_role: "user"
@@ -312,5 +320,5 @@ session:
 logging:
   level: "DEBUG"  # DEBUG, INFO, WARNING, ERROR
   format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-  file: "./logs/agent.log"
+  file: "./data/logs/agent.log"
   console: true

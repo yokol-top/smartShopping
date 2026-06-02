@@ -4,7 +4,7 @@ Orchestrator 任务记忆
 主Agent作为orchestrator，需要维护子Agent之间的结构化信息流转：
 - 从子Agent结果中提取结构化事实（商品、方案、订单等）
 - 解析用户引用（"方案一"→具体商品列表）
-- 向子Agent提供所需信息（通过消息总线应答）
+- 向子Agent构建任务时注入所需的结构化信息
 - 仅当自身也无法解析时，才向用户发起澄清
 
 生命周期：
@@ -22,7 +22,7 @@ class OrchestratorMemory:
 
     存储子Agent产出的结构化信息，供后续轮次的：
     1. 目标理解层：解析用户引用（"方案一"→具体商品）
-    2. 子Agent路由：enriche context
+    2. 子Agent路由：enrich context
     3. 子Agent信息请求：orchestrator 从记忆中应答
     """
 
@@ -43,9 +43,6 @@ class OrchestratorMemory:
         self._selected_plan_name: str = ""
         self._selected_products: List[Dict[str, Any]] = []
 
-        # 上一轮子Agent的原始结果（仅用于 LLM 提取，不直接暴露给子Agent）
-        self._last_raw_response: str = ""
-        self._last_route: str = ""
 
     # ================================================================
     # 写入：子Agent完成后由 orchestrator 调用
@@ -58,13 +55,14 @@ class OrchestratorMemory:
 
         orchestrator 在每次 dispatch 完成后调用此方法。
         """
-        self._last_raw_response = response
-        self._last_route = route
+        # 不依赖 route 字符串，基于响应内容自动判断提取策略
+        # 总是提取实体信息（订单号、商品ID等）
+        self._extract_entities_from_text(response)
 
-        if route == "presale":
+        # 如果响应包含推荐方案特征，额外提取方案结构
+        recommendation_hints = ['方案', '推荐', '¥', '套餐', '组合', '商品ID', 'P0']
+        if any(hint in response for hint in recommendation_hints):
             self._extract_recommendations(response)
-        elif route == "functional":
-            self._extract_operation_results(response)
 
         self.logger.info(
             f"[OrchestratorMemory] 更新记忆 | route={route} | "
@@ -310,12 +308,13 @@ class OrchestratorMemory:
         存入orchestrator记忆，避免后续步骤重复查询。
 
         Args:
-            step_result: 步骤执行结果文本（如MCP工具返回值）
+            step_result: 步骤执行结果文本（MCP工具返回值，可信来源）
         """
         if not step_result:
             return
         old_count = len(self._entities)
-        self._extract_entities_from_text(step_result)
+        # trusted_source=True：工具返回值是可信地址来源
+        self._extract_entities_from_text(step_result, trusted_source=True)
         new_count = len(self._entities)
         if new_count > old_count:
             new_ids = list(self._entities.keys())[old_count:]
@@ -323,8 +322,15 @@ class OrchestratorMemory:
                 f"[OrchestratorMemory] 从步骤结果中提取到 {new_count - old_count} 个实体: {new_ids}"
             )
 
-    def _extract_entities_from_text(self, text: str):
-        """从文本中提取结构化实体信息（ID + 关联详情）"""
+    def _extract_entities_from_text(self, text: str, trusted_source: bool = False):
+        """从文本中提取结构化实体信息（ID + 关联详情）
+
+        Args:
+            text: 待提取文本
+            trusted_source: 是否来自可信的工具执行结果。
+                True  → 允许写入 _address（真实 MCP 返回值）
+                False → 跳过 _address 提取（AI 生成文本，避免将提问内容误存为地址）
+        """
         import re
 
         # 提取各类ID
@@ -347,7 +353,6 @@ class OrchestratorMemory:
         for m in re.finditer(dict_pattern, text):
             entity_id = m.group(1)
             try:
-                # 尝试解析整个dict
                 import ast
                 entity_dict = ast.literal_eval(m.group(0))
                 if isinstance(entity_dict, dict) and entity_id:
@@ -355,15 +360,17 @@ class OrchestratorMemory:
             except (ValueError, SyntaxError):
                 pass
 
-        # 提取地址详情：匹配 "地址：xxx" 或 "location: xxx" 模式
-        addr_patterns = [
-            r'(?:地址|收货地址|address|location)[：:\s]*([^\n,，]+)',
-        ]
-        for pattern in addr_patterns:
-            for match in re.finditer(pattern, text, re.IGNORECASE):
-                addr_val = match.group(1).strip().rstrip('。）)')
-                if len(addr_val) > 5:  # 有效地址至少5个字符
-                    self._entities.setdefault("_address", {})["location"] = addr_val
+        # 提取地址详情：仅信任工具执行结果，不从 AI 生成文本中提取
+        # 避免把 AI 的提问内容（如"是否两件一起下单或先下某一件"）误存为地址
+        if trusted_source:
+            addr_patterns = [
+                r'(?:地址|收货地址|address|location)[：:\s]*([^\n,，]+)',
+            ]
+            for pattern in addr_patterns:
+                for match in re.finditer(pattern, text, re.IGNORECASE):
+                    addr_val = match.group(1).strip().rstrip('。）)')
+                    if len(addr_val) > 5:
+                        self._entities.setdefault("_address", {})["location"] = addr_val
 
         # 提取手机号
         phone_matches = re.findall(r'(?:电话|手机|phone|联系)[：:\s]*(1\d{10})', text)
@@ -453,5 +460,3 @@ class OrchestratorMemory:
         self._decisions.clear()
         self._selected_plan_name = ""
         self._selected_products.clear()
-        self._last_raw_response = ""
-        self._last_route = ""

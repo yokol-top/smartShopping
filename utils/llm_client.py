@@ -1,8 +1,10 @@
 import logging
 import time
 from contextlib import contextmanager
-from typing import List, Dict, Any, Optional, Iterator
+from typing import List, Dict, Optional
+
 from openai import OpenAI
+
 from observability import get_tracer
 
 
@@ -91,6 +93,12 @@ class LLMClient:
         max_tok = max_tokens if max_tokens is not None else self.max_tokens
 
         self.logger.debug(f"调用LLM - 消息数: {len(messages)}, 温度: {temp}")
+        if self.logger.isEnabledFor(logging.DEBUG):
+            for i, msg in enumerate(messages):
+                self.logger.debug(
+                    f"[LLM INPUT {i}] role={msg.get('role')} | "
+                    f"{msg.get('content', '')}"
+                )
 
         tracer = get_tracer()
         with (tracer.start_span("gen_ai.chat", {
@@ -114,6 +122,7 @@ class LLMClient:
 
                     result = response.choices[0].message.content
                     self.logger.debug(f"LLM响应长度: {len(result)}")
+                    self.logger.debug(f"[LLM OUTPUT] {result}")
 
                     # 记录 GenAI 标准属性
                     if tracer and tracer.enabled:

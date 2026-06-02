@@ -1,69 +1,51 @@
 """
 商品知识库生成器
 
-基于已有商品数据库的信息，自动生成售前客服常用的FAQ知识库：
-- 商品基本信息QA
-- 商品对比QA
-- 选购建议QA
-- 价格/库存/规格相关QA
+基于 init/product_descriptions.json 中的商品信息，自动生成售前客服FAQ知识库。
+同时将 init/product_descriptions.json 中的详细描述素材一并导入向量库。
 
-生成的QA对会存入独立的向量库collection（product_faq），并保留与商品ID的关联关系。
+生成的文档会存入向量库，并保留与商品ID的关联关系。
 """
 
-import sqlite3
+import os
 import logging
 import json
 from typing import List, Dict, Any, Tuple
 
+# 商品描述素材文件路径
+_INIT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'init')
+_DESCRIPTIONS_FILE = os.path.join(_INIT_DIR, 'product_descriptions.json')
 
-# 15个种子商品的结构化信息（与test_server_sse.py中的seed_data一致）
-SEED_PRODUCTS = [
-    {"id": "P001", "name": "iPhone 15 Pro Max", "category": "手机", "price": 9999.0, "brand": "Apple", "stock": 50,
-     "description": "Apple最新旗舰手机，A17 Pro芯片，钛金属边框，4800万像素主摄",
-     "highlights": ["A17 Pro芯片", "钛金属边框", "4800万像素主摄", "USB-C接口", "5倍光学变焦"]},
-    {"id": "P002", "name": "华为Mate 60 Pro", "category": "手机", "price": 6999.0, "brand": "华为", "stock": 30,
-     "description": "华为旗舰手机，麒麟9000S芯片，支持卫星通信，昆仑玻璃面板",
-     "highlights": ["麒麟9000S芯片", "卫星通信", "昆仑玻璃", "鸿蒙系统", "XMAGE影像"]},
-    {"id": "P003", "name": "小米14 Ultra", "category": "手机", "price": 5999.0, "brand": "小米", "stock": 80,
-     "description": "小米影像旗舰，徕卡Summilux镜头，骁龙8 Gen3处理器",
-     "highlights": ["徕卡Summilux镜头", "骁龙8 Gen3", "小米澎湃OS", "光影猎人900传感器", "75W无线快充"]},
-    {"id": "P004", "name": "MacBook Pro 16寸", "category": "笔记本电脑", "price": 19999.0, "brand": "Apple", "stock": 20,
-     "description": "M3 Max芯片，专业级笔记本，Liquid Retina XDR显示屏，续航22小时",
-     "highlights": ["M3 Max芯片", "Liquid Retina XDR", "22小时续航", "专业级性能", "MagSafe充电"]},
-    {"id": "P005", "name": "联想ThinkPad X1 Carbon", "category": "笔记本电脑", "price": 12999.0, "brand": "联想", "stock": 40,
-     "description": "商务轻薄本，14英寸2.8K OLED屏，碳纤维机身，通过MIL-STD军标认证",
-     "highlights": ["2.8K OLED屏", "碳纤维机身", "军标认证", "指纹+红外解锁", "Intel Evo平台"]},
-    {"id": "P006", "name": "华为MateBook X Pro", "category": "笔记本电脑", "price": 11999.0, "brand": "华为", "stock": 25,
-     "description": "华为旗舰轻薄本，3.1K触控屏，超级终端多设备协同",
-     "highlights": ["3.1K触控屏", "超级终端", "多设备协同", "金属一体成型", "6扬声器"]},
-    {"id": "P007", "name": "索尼WH-1000XM5", "category": "耳机", "price": 2499.0, "brand": "索尼", "stock": 100,
-     "description": "旗舰降噪头戴式耳机，30mm驱动单元，自动降噪优化，30小时续航",
-     "highlights": ["旗舰降噪", "30mm驱动单元", "30小时续航", "多点连接", "自适应降噪"]},
-    {"id": "P008", "name": "AirPods Pro 2", "category": "耳机", "price": 1899.0, "brand": "Apple", "stock": 200,
-     "description": "主动降噪无线耳机，H2芯片，自适应通透模式，USB-C充电",
-     "highlights": ["H2芯片", "自适应通透", "个性化空间音频", "USB-C充电", "IP54防尘防水"]},
-    {"id": "P009", "name": "iPad Air 5", "category": "平板电脑", "price": 4799.0, "brand": "Apple", "stock": 60,
-     "description": "M1芯片平板电脑，10.9英寸Liquid Retina屏，支持Apple Pencil 2代",
-     "highlights": ["M1芯片", "10.9英寸", "Apple Pencil 2代", "Center Stage", "5G可选"]},
-    {"id": "P010", "name": "华为MatePad Pro 13.2", "category": "平板电脑", "price": 5699.0, "brand": "华为", "stock": 35,
-     "description": "华为旗舰平板，13.2英寸OLED柔性屏，星闪连接，支持手写笔",
-     "highlights": ["13.2英寸OLED", "星闪连接", "鸿蒙系统", "M-Pencil 3代", "PC级应用"]},
-    {"id": "P011", "name": "戴森V15吸尘器", "category": "家电", "price": 4990.0, "brand": "戴森", "stock": 45,
-     "description": "激光探测无绳吸尘器，可视化灰尘检测，240AW强劲吸力，60分钟续航",
-     "highlights": ["激光探测", "灰尘可视化", "240AW吸力", "60分钟续航", "整机HEPA过滤"]},
-    {"id": "P012", "name": "海尔冰箱BCD-500", "category": "家电", "price": 3299.0, "brand": "海尔", "stock": 15,
-     "description": "500升对开门冰箱，风冷无霜，DEO净味，一级能效",
-     "highlights": ["500升大容量", "风冷无霜", "DEO净味", "一级能效", "变频压缩机"]},
-    {"id": "P013", "name": "Nike Air Max 270", "category": "运动鞋", "price": 899.0, "brand": "Nike", "stock": 150,
-     "description": "经典气垫运动鞋，270度可视Air气垫，网面透气鞋面，轻量缓震",
-     "highlights": ["270度Air气垫", "网面透气", "轻量缓震", "经典配色", "日常休闲跑步"]},
-    {"id": "P014", "name": "Adidas Ultraboost", "category": "运动鞋", "price": 1299.0, "brand": "Adidas", "stock": 120,
-     "description": "Boost缓震跑步鞋，Primeknit编织鞋面，Continental马牌橡胶外底",
-     "highlights": ["Boost缓震", "Primeknit编织", "马牌橡胶外底", "专业跑步", "回弹性能"]},
-    {"id": "P015", "name": "Apple Watch Ultra 2", "category": "智能手表", "price": 6499.0, "brand": "Apple", "stock": 30,
-     "description": "户外探险智能手表，钛金属表壳，双频GPS精准定位，100米防水，36小时续航",
-     "highlights": ["钛金属表壳", "双频GPS", "100米防水", "36小时续航", "S9芯片"]},
-]
+
+def _load_products_from_json() -> List[Dict[str, Any]]:
+    """从 init/product_descriptions.json 加载商品信息"""
+    if not os.path.exists(_DESCRIPTIONS_FILE):
+        logging.warning(f"商品描述文件不存在: {_DESCRIPTIONS_FILE}")
+        return []
+    with open(_DESCRIPTIONS_FILE, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+
+def _get_seed_products() -> List[Dict[str, Any]]:
+    """获取种子商品列表（兼容旧接口）"""
+    raw = _load_products_from_json()
+    products = []
+    for p in raw:
+        if p.get('product_id', '').startswith('P'):
+            products.append({
+                'id': p['product_id'],
+                'name': p['product_name'],
+                'category': p['category'],
+                'brand': p.get('brand', ''),
+                'price': p.get('price', 0),
+                'stock': 0,  # 实际库存从数据库获取
+                'description': '',
+            })
+    return products
+
+
+# 兼容旧代码引用
+SEED_PRODUCTS = _get_seed_products()
 
 
 def generate_product_faqs() -> List[Dict[str, Any]]:

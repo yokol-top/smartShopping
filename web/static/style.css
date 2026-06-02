@@ -287,6 +287,19 @@ body {
     flex: 1;
     font-size: 16px;
     font-weight: 600;
+    cursor: text;
+    padding: 2px 8px;
+    border-radius: 6px;
+    border: 1px solid transparent;
+    outline: none;
+    transition: border-color 0.2s, background 0.2s;
+}
+.chat-header h2:hover {
+    border-color: #e2e8f0;
+}
+.chat-header h2:focus {
+    border-color: #6366f1;
+    background: #f8fafc;
 }
 
 .header-actions { display: flex; gap: 4px; }

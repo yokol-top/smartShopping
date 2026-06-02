@@ -1,14 +1,15 @@
-import yaml
-import requests
-import logging
-from typing import Dict, Any, List, Optional
-import os
 import asyncio
+import json
+import logging
+import os
+import uuid
+from typing import Dict, Any, List, Optional
+
+import requests
+import yaml
 from mcp import ClientSession
 from mcp.client.sse import sse_client
 
-import json
-import uuid
 from observability import get_tracer
 
 
@@ -40,7 +41,8 @@ class MCPManager:
         self.enabled_servers = []
         self._server_tools_cache = {}  # 缓存从MCP服务器获取的工具列表
         self._server_info_cache = {}  # 缓存从MCP服务器获取的服务器信息
-        
+        self._tool_cat_cache: Dict[str, List[str]] = {}  # 工具名 → 类别列表
+
         self._load_config()
         
         self.logger.info(f"初始化MCP管理器，启用 {len(self.enabled_servers)} 个服务")
@@ -210,7 +212,133 @@ class MCPManager:
                 })
         
         return tools
-    
+
+    # ================================================================
+    # 按阶段/意图过滤工具
+    # ================================================================
+
+    # 工具类别关键词规则（工具名或描述中包含这些词则归入对应类别）
+    _TOOL_CATEGORY_RULES: Dict[str, Dict[str, List[str]]] = {
+        'search': {
+            'name': ['search', 'knowledge'],
+            'desc': ['搜索', '检索', '知识库', 'faq', '商品信息', 'search'],
+        },
+        'order': {
+            'name': ['order', 'create_complex'],
+            'desc': ['下单', '订单', '购买', '创建订单', '批量创建'],
+        },
+        'user': {
+            'name': ['user', 'profile'],
+            'desc': ['用户', '地址', '银行卡', '创建用户', '修改用户', '查询用户'],
+        },
+    }
+
+    # 意图类型 → 允许的工具类别（None 表示返回全量，[] 表示不需要工具）
+    _INTENT_CATEGORIES: Dict[str, Optional[List[str]]] = {
+        'greeting': [],
+        'simple_chat': [],
+        'rag_simple': ['search'],
+        'rag_advanced': ['search'],
+        'mcp_ask_info': None,
+    }
+
+    def _classify_tool(self, tool: Dict[str, Any]) -> List[str]:
+        """根据工具名称和描述关键词将工具归入一个或多个类别"""
+        name = tool.get('name', '').lower()
+        desc = tool.get('description', '').lower()
+        categories = []
+        for cat, rules in self._TOOL_CATEGORY_RULES.items():
+            if any(k in name for k in rules['name']) or any(k in desc for k in rules['desc']):
+                categories.append(cat)
+        return categories or ['other']
+
+    def _ensure_tool_cat_cache(self, all_tools: List[Dict[str, Any]]) -> None:
+        """（惰性）构建工具类别缓存"""
+        if self._tool_cat_cache:
+            return
+        for tool in all_tools:
+            name = tool.get('name', '')
+            if name:
+                self._tool_cat_cache[name] = self._classify_tool(tool)
+
+    def _infer_categories_from_query(self, query: str) -> List[str]:
+        """根据查询关键词推断需要哪些工具类别（用于 mcp_execute 意图）"""
+        q = query.lower()
+        cats: set = {'search'}  # 搜索工具作为安全基线
+
+        order_kws = ['下单', '订单', '购买', '买', 'order', '创建订单', '支付', '结算', '确认下单']
+        user_kws = ['用户', '地址', '银行卡', '账户', '收货', '我的信息', '登录', '注册']
+        search_kws = ['搜索', '推荐', '商品', 'search', '找', '哪款', '对比', '查找']
+
+        if any(kw in q for kw in order_kws):
+            cats.add('order')
+            cats.add('user')   # 下单操作通常需要用户信息（地址/银行卡）
+        if any(kw in q for kw in user_kws):
+            cats.add('user')
+        if any(kw in q for kw in search_kws):
+            cats.add('search')
+
+        return list(cats)
+
+    def get_tools_for_context(
+        self,
+        intent_type: str = None,
+        query: str = "",
+    ) -> List[Dict[str, Any]]:
+        """按当前阶段/意图返回过滤后的工具列表。
+
+        - 导购阶段（rag_simple/rag_advanced）：只返回搜索类工具
+        - 问候/闲聊：不返回工具
+        - mcp_execute：根据 query 关键词推断所需类别
+        - None 或未知意图：返回全量（安全兜底）
+
+        Args:
+            intent_type: 意图类型字符串（如 'rag_simple'、'mcp_execute'）
+            query: 用户查询文本，用于 mcp_execute 时进一步推断
+
+        Returns:
+            过滤后的工具列表
+        """
+        all_tools = self.get_available_tools(use_cache=True)
+        if not all_tools:
+            return []
+
+        # 构建/复用工具类别缓存
+        self._ensure_tool_cat_cache(all_tools)
+
+        # 确定允许的类别
+        if intent_type in self._INTENT_CATEGORIES:
+            allowed = self._INTENT_CATEGORIES[intent_type]
+        elif intent_type == 'mcp_execute':
+            allowed = self._infer_categories_from_query(query)
+        else:
+            return all_tools  # 未知意图，返回全量
+
+        if allowed is None:
+            return all_tools  # None = 全量
+
+        if not allowed:
+            return []  # 空列表 = 无需工具
+
+        # 按类别过滤
+        filtered = [
+            t for t in all_tools
+            if any(cat in allowed for cat in self._tool_cat_cache.get(t.get('name', ''), ['other']))
+        ]
+
+        # 兜底：过滤结果为空时返回全量
+        if not filtered:
+            self.logger.warning(
+                f"[MCPManager] 按意图 '{intent_type}' 过滤后工具为空，回退到全量"
+            )
+            return all_tools
+
+        self.logger.debug(
+            f"[MCPManager] get_tools_for_context | intent={intent_type} | "
+            f"total={len(all_tools)} → filtered={len(filtered)}"
+        )
+        return filtered
+
     async def _call_tool_sse(
         self,
         endpoint: str,

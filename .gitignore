@@ -32,9 +32,11 @@ ENV/
 *.swp
 *.swo
 *~
+.claude
 
 # Project specific
 data/
+init/data/
 logs/
 model/
 
@@ -46,5 +48,7 @@ Thumbs.db
 .ipynb_checkpoints
 
 # Environment variables
-.env
+
 .env.local
+
+LICENSE

@@ -11,9 +11,9 @@
 import json
 import logging
 import os
-import time
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Dict, Any, List, Optional
 
 from utils.db_pool import ConnectionPool
@@ -25,13 +25,13 @@ class SessionInfo:
     session_id: str
     user_id: str
     title: str
-    created_at: float
-    updated_at: float
+    created_at: str
+    updated_at: str
     message_count: int = 0
 
     def to_display(self) -> str:
         """格式化为展示字符串"""
-        ts = time.strftime('%Y-%m-%d %H:%M', time.localtime(self.updated_at))
+        ts = self.updated_at[:16] if len(self.updated_at) > 16 else self.updated_at
         return f"[{ts}] {self.title}  ({self.message_count} 条消息)"
 
 
@@ -42,7 +42,7 @@ class ConversationMessage:
     session_id: str
     role: str           # user / assistant / system
     content: str
-    created_at: float
+    created_at: str
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -70,44 +70,7 @@ class SessionManager:
         # 每用户最大会话数
         self.max_sessions_per_user = session_config.get('max_sessions_per_user', 50)
 
-        self._init_db()
         self.logger.info(f"SessionManager 初始化 | DB: {self.db_path} | 连接池: {pool_size}")
-
-    # ================================================================
-    # 数据库初始化
-    # ================================================================
-
-    def _init_db(self):
-        with self._pool.get_conn() as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS sessions (
-                    session_id TEXT PRIMARY KEY,
-                    user_id    TEXT NOT NULL,
-                    title      TEXT NOT NULL DEFAULT '新会话',
-                    created_at REAL NOT NULL,
-                    updated_at REAL NOT NULL
-                )
-            """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_sessions_user
-                ON sessions(user_id, updated_at DESC)
-            """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS messages (
-                    message_id TEXT PRIMARY KEY,
-                    session_id TEXT NOT NULL,
-                    role       TEXT NOT NULL,
-                    content    TEXT NOT NULL,
-                    metadata   TEXT DEFAULT '{}',
-                    created_at REAL NOT NULL,
-                    FOREIGN KEY (session_id) REFERENCES sessions(session_id)
-                )
-            """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_messages_session
-                ON messages(session_id, created_at ASC)
-            """)
-            conn.commit()
 
     # ================================================================
     # 会话 CRUD
@@ -125,7 +88,7 @@ class SessionManager:
             SessionInfo
         """
         session_id = str(uuid.uuid4())
-        now = time.time()
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         title = title or '新会话'
 
         with self._pool.get_conn() as conn:
@@ -208,10 +171,12 @@ class SessionManager:
         )
 
     def delete_session(self, session_id: str):
-        """删除会话及其所有消息"""
+        """删除会话及其所有关联数据"""
         with self._pool.get_conn() as conn:
-            conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
-            conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+            # 先删除子表，再删主表
+            conn.execute("DELETE FROM messages    WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM task_states WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM sessions    WHERE session_id = ?", (session_id,))
             conn.commit()
         self.logger.info(f"删除会话 {session_id[:8]}...")
 
@@ -230,7 +195,9 @@ class SessionManager:
 
         placeholders = ','.join('?' * len(session_ids))
         with self._pool.get_conn() as conn:
-            conn.execute(f"DELETE FROM messages WHERE session_id IN ({placeholders})", session_ids)
+            # 先删除所有子表记录，再删除主表，满足外键约束
+            conn.execute(f"DELETE FROM messages    WHERE session_id IN ({placeholders})", session_ids)
+            conn.execute(f"DELETE FROM task_states WHERE session_id IN ({placeholders})", session_ids)
             cursor = conn.execute(f"DELETE FROM sessions WHERE session_id IN ({placeholders})", session_ids)
             deleted = cursor.rowcount
             conn.commit()
@@ -259,7 +226,9 @@ class SessionManager:
             session_ids = [r[0] for r in rows]
             placeholders = ','.join('?' * len(session_ids))
 
-            conn.execute(f"DELETE FROM messages WHERE session_id IN ({placeholders})", session_ids)
+            # 先删除所有子表记录，再删除主表，满足外键约束
+            conn.execute(f"DELETE FROM messages    WHERE session_id IN ({placeholders})", session_ids)
+            conn.execute(f"DELETE FROM task_states WHERE session_id IN ({placeholders})", session_ids)
             conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
             conn.commit()
 
@@ -271,7 +240,7 @@ class SessionManager:
         with self._pool.get_conn() as conn:
             conn.execute(
                 "UPDATE sessions SET title = ?, updated_at = ? WHERE session_id = ?",
-                (title, time.time(), session_id)
+                (title, datetime.now().strftime('%Y-%m-%d %H:%M:%S'), session_id)
             )
             conn.commit()
 
@@ -294,7 +263,7 @@ class SessionManager:
             message_id
         """
         message_id = str(uuid.uuid4())
-        now = time.time()
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         meta_json = json.dumps(metadata or {}, ensure_ascii=False)
 
         with self._pool.get_conn() as conn:
@@ -325,7 +294,6 @@ class SessionManager:
         """
         with self._pool.get_conn() as conn:
             if last_n:
-                # 子查询取最后N条，再按时间正序
                 rows = conn.execute(
                     """
                     SELECT role, content, created_at, metadata FROM (
@@ -352,6 +320,47 @@ class SessionManager:
             }
             for r in rows
         ]
+
+    def save_task_state(self, session_id: str, task_json: str) -> str:
+        """将任务状态持久化到 task_states 表。
+
+        同一 session 只保留最新一条（先删后插）。
+
+        Args:
+            session_id: 会话ID
+            task_json: 任务状态JSON字符串
+
+        Returns:
+            state_id
+        """
+        state_id = str(uuid.uuid4())
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+        with self._pool.get_conn() as conn:
+            # 删除旧的任务状态（保留最新）
+            conn.execute(
+                "DELETE FROM task_states WHERE session_id = ?",
+                (session_id,)
+            )
+            conn.execute(
+                "INSERT INTO task_states (state_id, session_id, task_json, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (state_id, session_id, task_json, now)
+            )
+            conn.commit()
+
+        self.logger.debug(f"任务状态已保存: session={session_id[:8]}...")
+        return state_id
+
+    def get_last_task_state(self, session_id: str) -> Optional[str]:
+        """获取会话的最新任务状态JSON，不存在返回 None。"""
+        with self._pool.get_conn() as conn:
+            row = conn.execute(
+                "SELECT task_json FROM task_states "
+                "WHERE session_id = ? ORDER BY created_at DESC LIMIT 1",
+                (session_id,)
+            ).fetchone()
+        return row[0] if row else None
 
     def get_message_count(self, session_id: str) -> int:
         """获取会话消息数"""

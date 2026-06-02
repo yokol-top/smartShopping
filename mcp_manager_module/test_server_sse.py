@@ -1,5 +1,5 @@
-import sys
 import os
+import sys
 
 # 将 test_project 加入搜索路径，以便复用共享的 ConnectionPool
 _project_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')
@@ -38,150 +38,25 @@ def _hash_password(password: str, salt: str) -> str:
 
 
 # ================================================================
-# 数据库初始化
+# 数据库检查（建表和种子数据由 init/init_db.py 统一管理）
 # ================================================================
 
-def _init_db():
-    """初始化所有表并插入种子数据"""
-    with db_pool.get_conn() as conn:
-        _init_db_inner(conn)
-
-
-def _init_db_inner(conn):
-    cursor = conn.cursor()
-
-    # --- 用户表 ---
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id       TEXT PRIMARY KEY,
-            username      TEXT NOT NULL,
-            password_hash TEXT NOT NULL,
-            salt          TEXT NOT NULL,
-            role          TEXT NOT NULL DEFAULT 'user',
-            phone         TEXT DEFAULT '',
-            created_at    TEXT NOT NULL
+def _check_db():
+    """检查数据库是否已初始化，未初始化时给出提示"""
+    try:
+        with db_pool.get_conn() as conn:
+            conn.execute("SELECT COUNT(*) FROM products").fetchone()
+            conn.execute("SELECT COUNT(*) FROM users").fetchone()
+        logging.info("数据库连接正常")
+    except Exception as e:
+        logging.error(
+            f"数据库未初始化或表不存在: {e}\n"
+            f"请先运行: python -m init.init_db"
         )
-    """)
-
-    # --- 地址表 ---
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS addresses (
-            id           TEXT PRIMARY KEY,
-            user_id      TEXT NOT NULL,
-            location     TEXT NOT NULL DEFAULT '',
-            phone_number TEXT DEFAULT '',
-            tag          TEXT DEFAULT '',
-            FOREIGN KEY (user_id) REFERENCES users(user_id)
-        )
-    """)
-
-    # --- 银行卡表 ---
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS bank_cards (
-            id       TEXT PRIMARY KEY,
-            user_id  TEXT NOT NULL,
-            card_num TEXT NOT NULL,
-            level    TEXT NOT NULL DEFAULT '普通卡',
-            FOREIGN KEY (user_id) REFERENCES users(user_id)
-        )
-    """)
-
-    # --- 订单表 ---
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS orders (
-            order_id   TEXT PRIMARY KEY,
-            user_id    TEXT NOT NULL,
-            product    TEXT NOT NULL,
-            quantity   INTEGER NOT NULL,
-            customer   TEXT NOT NULL,
-            address    TEXT NOT NULL,
-            card_end   TEXT NOT NULL,
-            status     TEXT NOT NULL DEFAULT '已下单',
-            created_at TEXT NOT NULL,
-            FOREIGN KEY (user_id) REFERENCES users(user_id)
-        )
-    """)
-
-    # --- 商品表 ---
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS products (
-            id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            category TEXT NOT NULL,
-            price REAL NOT NULL,
-            brand TEXT NOT NULL,
-            stock INTEGER NOT NULL DEFAULT 0,
-            description TEXT DEFAULT ''
-        )
-    """)
-
-    # --- 种子数据：用户 ---
-    cursor.execute("SELECT COUNT(*) FROM users")
-    if cursor.fetchone()[0] == 0:
-        admin_salt = secrets.token_hex(16)
-        admin_hash = _hash_password('admin123', admin_salt)
-        cursor.execute(
-            "INSERT INTO users (user_id, username, password_hash, salt, role, phone, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            ('UID-0001', 'admin', admin_hash, admin_salt, 'admin', '13800000000',
-             datetime.now().isoformat())
-        )
-        user_salt = secrets.token_hex(16)
-        user_hash = _hash_password('123456', user_salt)
-        cursor.execute(
-            "INSERT INTO users (user_id, username, password_hash, salt, role, phone, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            ('UID-8888', '张三', user_hash, user_salt, 'user', '18511112222',
-             datetime.now().isoformat())
-        )
-        logging.info("已初始化种子用户: 管理员(admin/admin123), 张三(user/123456)")
-
-    # --- 种子数据：商品 ---
-    cursor.execute("SELECT COUNT(*) FROM products")
-    if cursor.fetchone()[0] == 0:
-        seed_data = [
-            ("P001", "iPhone 15 Pro Max", "手机", 9999.0, "Apple", 50,
-             "Apple最新旗舰手机，A17 Pro芯片，钛金属边框，4800万像素主摄"),
-            ("P002", "华为Mate 60 Pro", "手机", 6999.0, "华为", 30,
-             "华为旗舰手机，麒麟9000S芯片，支持卫星通信，昆仑玻璃面板"),
-            ("P003", "小米14 Ultra", "手机", 5999.0, "小米", 80,
-             "小米影像旗舰，徕卡Summilux镜头，骁龙8 Gen3处理器"),
-            ("P004", "MacBook Pro 16寸", "笔记本电脑", 19999.0, "Apple", 20,
-             "M3 Max芯片，专业级笔记本，Liquid Retina XDR显示屏，续航22小时"),
-            ("P005", "联想ThinkPad X1 Carbon", "笔记本电脑", 12999.0, "联想", 40,
-             "商务轻薄本，14英寸2.8K OLED屏，碳纤维机身，通过MIL-STD军标认证"),
-            ("P006", "华为MateBook X Pro", "笔记本电脑", 11999.0, "华为", 25,
-             "华为旗舰轻薄本，3.1K触控屏，超级终端多设备协同"),
-            ("P007", "索尼WH-1000XM5", "耳机", 2499.0, "索尼", 100,
-             "旗舰降噪头戴式耳机，30mm驱动单元，自动降噪优化，30小时续航"),
-            ("P008", "AirPods Pro 2", "耳机", 1899.0, "Apple", 200,
-             "主动降噪无线耳机，H2芯片，自适应通透模式，USB-C充电"),
-            ("P009", "iPad Air 5", "平板电脑", 4799.0, "Apple", 60,
-             "M1芯片平板电脑，10.9英寸Liquid Retina屏，支持Apple Pencil 2代"),
-            ("P010", "华为MatePad Pro 13.2", "平板电脑", 5699.0, "华为", 35,
-             "华为旗舰平板，13.2英寸OLED柔性屏，星闪连接，支持手写笔"),
-            ("P011", "戴森V15吸尘器", "家电", 4990.0, "戴森", 45,
-             "激光探测无绳吸尘器，可视化灰尘检测，240AW强劲吸力，60分钟续航"),
-            ("P012", "海尔冰箱BCD-500", "家电", 3299.0, "海尔", 15,
-             "500升对开门冰箱，风冷无霜，DEO净味，一级能效"),
-            ("P013", "Nike Air Max 270", "运动鞋", 899.0, "Nike", 150,
-             "经典气垫运动鞋，270度可视Air气垫，网面透气鞋面，轻量缓震"),
-            ("P014", "Adidas Ultraboost", "运动鞋", 1299.0, "Adidas", 120,
-             "Boost缓震跑步鞋，Primeknit编织鞋面，Continental马牌橡胶外底"),
-            ("P015", "Apple Watch Ultra 2", "智能手表", 6499.0, "Apple", 30,
-             "户外探险智能手表，钛金属表壳，双频GPS精准定位，100米防水，36小时续航"),
-        ]
-        cursor.executemany(
-            "INSERT INTO products (id, name, category, price, brand, stock, description) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            seed_data
-        )
-        logging.info(f"已初始化 {len(seed_data)} 条商品数据")
-
-    conn.commit()
+        raise SystemExit(1)
 
 
-# 启动时初始化数据库
-_init_db()
+_check_db()
 
 
 # ================================================================
@@ -271,7 +146,7 @@ def create_user(operator_id: str, username: str, password: str,
             conn.execute(
                 "INSERT INTO users (user_id, username, password_hash, salt, role, phone, created_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (user_id, username, password_hash, salt, role, phone, datetime.now().isoformat())
+                (user_id, username, password_hash, salt, role, phone, datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
             )
             conn.commit()
         except sqlite3.IntegrityError:
@@ -484,7 +359,7 @@ def create_complex_order(
                 "INSERT INTO orders (order_id, user_id, product, quantity, customer, address, card_end, status, created_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (order_id, user_id, pid, quantity, customer_name, address_id,
-                 card_id, '已下单', datetime.now().isoformat())
+                 card_id, '已下单', datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
             )
             results.append(f"✓ {order_id} - {product[1]}（¥{product[2]}）x{quantity}")
         conn.commit()

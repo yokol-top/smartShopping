@@ -11,8 +11,9 @@
 """
 import json
 import logging
-from typing import Dict, Any, Optional, List
 from dataclasses import dataclass, field
+from typing import Dict, Any, Optional, List
+
 from observability import get_tracer
 from .intent_recognizer import IntentRecognizer, IntentType, TaskComplexity, IntentResult
 
@@ -128,8 +129,22 @@ class GoalUnderstanding:
                     f"{orchestrator_context[-300:]}"
                 )
 
-            # Step 1: 基础意图识别
-            intent_result = self.intent_recognizer.recognize(user_input, conversation_context)
+            # Step 2: 预注入长期记忆（避免低置信度时的二次LLM调用）
+            # 策略：在第一次 recognize 之前就查询记忆并注入上下文，
+            # 这样无论置信度高低都只需要一次 LLM 调用。
+            memory_context = ""
+            memory_used = False
+            if self.use_memory_reasoning:
+                memory_context = self._retrieve_memory_context(user_input)
+                if memory_context:
+                    memory_used = True
+                    self.logger.info("[目标理解] 预注入长期记忆辅助推理（单次LLM调用）")
+
+            # Step 1: 基础意图识别（预注入记忆上下文，单次LLM调用完成）
+            enriched_context = conversation_context
+            if memory_context:
+                enriched_context = f"{conversation_context}\n\n[长期记忆参考]\n{memory_context}"
+            intent_result = self.intent_recognizer.recognize(user_input, enriched_context)
             confidence = intent_result.confidence
             self.logger.info(
                 f"[目标理解] 基础意图: {intent_result.intent_type.value} | "
@@ -144,26 +159,6 @@ class GoalUnderstanding:
                     user_goal="问候",
                     confidence=1.0,
                 )
-
-            # Step 2: 低置信度 → 尝试用长期记忆辅助推理
-            memory_context = ""
-            memory_used = False
-            if confidence < self.clarification_threshold and self.use_memory_reasoning:
-                memory_context = self._retrieve_memory_context(user_input)
-                if memory_context:
-                    memory_used = True
-                    self.logger.info("[目标理解] 使用长期记忆辅助推理")
-                    # 用记忆上下文重新识别
-                    enhanced_context = f"{conversation_context}\n\n[长期记忆参考]\n{memory_context}"
-                    intent_result = self.intent_recognizer.recognize(user_input, enhanced_context)
-                    confidence = intent_result.confidence
-                    self.logger.info(
-                        f"[目标理解] 记忆增强后置信度: {confidence:.2f} | "
-                        f"意图: {intent_result.intent_type.value} | tool: {intent_result.tool_name or '(无)'}"
-                    )
-                    self.logger.debug(
-                        f"[目标理解] 记忆上下文(200): {memory_context[:200]}"
-                    )
 
             # Step 3: 判断是否需要澄清
             needs_clarification = False
@@ -295,12 +290,26 @@ class GoalUnderstanding:
             params_desc = self._flatten_schema(tool_schema)
             schema_text = "\n".join(params_desc)
 
-        # 构建已知信息段
+        # 构建已知信息段：先提取关键 ID，再附上上下文原文（防止截断丢失关键实体）
         known_info_section = ""
         if orchestrator_context:
+            import re as _re
+            # 优先提取最后出现的 CARD-xxx / ADDR-xxx，显式列出避免被截断遮蔽
+            card_ids = _re.findall(r'CARD-\d+', orchestrator_context)
+            addr_ids = _re.findall(r'ADDR-\d+', orchestrator_context)
+            key_entity_lines = []
+            if card_ids:
+                key_entity_lines.append(f"  - 银行卡ID(card_id): {card_ids[-1]}")
+            if addr_ids:
+                key_entity_lines.append(f"  - 收货地址ID(address_id): {addr_ids[-1]}")
+            key_entity_block = (
+                "\n已知关键实体ID（上下文已提供，视为参数已知）:\n"
+                + "\n".join(key_entity_lines)
+                if key_entity_lines else ""
+            )
             known_info_section = f"""
 Orchestrator已知信息（包含之前子Agent的结果、用户已提供的实体信息）:
-{orchestrator_context[:500]}
+{orchestrator_context[:800]}{key_entity_block}
 """
 
         prompt = f"""你是一个参数完整性检查助手。用户想执行工具 "{intent_result.tool_name}"。
@@ -316,11 +325,11 @@ Orchestrator已知信息（包含之前子Agent的结果、用户已提供的实
 请严格按照上述"工具参数说明"中列出的参数来判断，用户是否提供了足够的信息。
 判断规则：
 1. 只检查工具参数说明中列出的参数，不要凭常识添加额外要求
-2. 对话上下文中已有的信息（如用户ID、之前提到的数据）也算作已提供
-3. Orchestrator已知信息中的实体（商品、地址、银行卡、方案等）也算作已提供
-4. 用户说"用当前信息"、"用我的信息"等表示使用已有数据，不需要再次提供
-5. 可选参数（非必需）即使没提供也算完整
-6. 如果工具参数是嵌套对象，只要用户提供了对象中的关键字段即可
+2. 对话上下文和Orchestrator中已有的信息（如用户ID、之前提到的数据）和实体（商品、地址、ID、银行卡、方案等）也算作已提供
+3. 用户说"用当前信息"、"用我的信息"、"系统中有我的信息"等表示使用已有数据，不需要再次提供
+4. 可选参数（非必需）即使没提供也算完整
+5. 如果工具参数是嵌套对象，只要用户提供了对象中的关键字段即可
+6. quantity（数量）若未明确说明，默认为1，不算缺失
 
 返回JSON格式:
 {{"is_complete": true/false, "missing": ["缺少的工具参数名1", "缺少的工具参数名2"], "reason": "判断原因"}}
@@ -521,11 +530,15 @@ Orchestrator已知信息（包含之前子Agent的结果、用户已提供的实
         intent_type = intent_result.intent_type
         reason = intent_result.reason or ""
 
-        # 目标：优先用意图识别的 reason，退化用原始输入
-        goal = reason if reason else user_input
+        # 目标：优先用 _llm_recognize 扩展字段中的 goal，其次用 reason，最后退化用原始输入
+        llm_goal = getattr(intent_result, '_goal', '')
+        goal = llm_goal if llm_goal else (reason if reason else user_input)
 
-        # 约束条件和成功标准：基于意图类型规则派生
-        constraints = []
+        # 约束：优先用 _llm_recognize 扩展字段中的 constraints
+        llm_constraints = getattr(intent_result, '_constraints', [])
+
+        # 约束条件：合并 LLM 提取的约束 + 规则派生的约束
+        constraints = list(llm_constraints)  # 先复制 LLM 提取的约束
         success_criteria = []
 
         if intent_type == IntentType.MCP_EXECUTE:

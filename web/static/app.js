@@ -104,7 +104,7 @@ function renderSessionList(sessions) {
 
     list.innerHTML = sessions.map(s => {
         const active = s.session_id === state.sessionId ? ' active' : '';
-        const date = new Date(s.updated_at * 1000).toLocaleDateString('zh-CN', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+        const date = typeof s.updated_at === 'string' ? s.updated_at.substring(5, 16) : '';
         return `
             <div class="session-item${active}" onclick="switchSession('${s.session_id}')" title="${s.title}">
                 <span class="session-title">💬 ${escapeHtml(s.title)}</span>
@@ -164,20 +164,15 @@ async function loadHistory(sessionId) {
         const data = await api(`/api/sessions/${sessionId}/history?user_id=${state.userId}`);
         clearMessages();
 
+        // 使用数据库中保存的会话标题
+        updateChatTitle(data.title || '新对话');
+
         if (!data.messages.length) {
             showWelcome();
-            updateChatTitle('新对话');
             return;
         }
 
         data.messages.forEach(m => appendMessage(m.role, m.content));
-
-        // 更新标题
-        const firstUser = data.messages.find(m => m.role === 'user');
-        if (firstUser) {
-            const title = firstUser.content.substring(0, 30) + (firstUser.content.length > 30 ? '...' : '');
-            updateChatTitle(title);
-        }
 
         scrollToBottom();
     } catch (e) {
@@ -311,7 +306,55 @@ function showWelcome() {
 }
 
 function updateChatTitle(title) {
-    document.getElementById('chat-title').textContent = title;
+    const el = document.getElementById('chat-title');
+    el.textContent = title;
+    el.dataset.originalTitle = title;  // 记录原始标题，用于判断是否修改
+}
+
+// 会话标题编辑：失去焦点时自动保存（仅在有修改时调用接口）
+(function initTitleEditor() {
+    const titleEl = document.getElementById('chat-title');
+    if (!titleEl) return;
+
+    titleEl.addEventListener('focus', () => {
+        titleEl.dataset.originalTitle = titleEl.textContent.trim();
+    });
+
+    titleEl.addEventListener('blur', () => {
+        const newTitle = titleEl.textContent.trim();
+        const oldTitle = titleEl.dataset.originalTitle || '';
+        if (!newTitle) {
+            titleEl.textContent = oldTitle;
+            return;
+        }
+        if (newTitle !== oldTitle && state.sessionId) {
+            saveTitleToServer(state.sessionId, newTitle);
+        }
+    });
+
+    titleEl.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+            e.preventDefault();
+            titleEl.blur();
+        }
+        if (e.key === 'Escape') {
+            titleEl.textContent = titleEl.dataset.originalTitle || '';
+            titleEl.blur();
+        }
+    });
+})();
+
+async function saveTitleToServer(sessionId, title) {
+    try {
+        await api(`/api/sessions/${sessionId}/title`, {
+            method: 'PUT',
+            body: JSON.stringify({ user_id: state.userId, title }),
+        });
+        // 更新侧边栏中对应会话的标题
+        loadSessions();
+    } catch (e) {
+        console.error('更新标题失败:', e);
+    }
 }
 
 function scrollToBottom() {

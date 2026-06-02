@@ -1,5 +1,6 @@
 import logging
 from typing import List
+
 from utils.llm_client import LLMClient
 
 
@@ -105,3 +106,55 @@ class MultiQueryGenerator:
         except Exception as e:
             self.logger.error(f"多查询生成失败: {e}")
             return [query]
+
+
+class CoRefResolver:
+    """Level 1 轻量指代消解：只解决"这款/那个/它"等指代词，不做语义改写。
+
+    设计原则：
+    - Prompt 极短，只取最近 400 字上下文，减少 token 消耗
+    - temperature=0.1，输出稳定
+    - 失败时静默降级，返回原始查询
+    """
+
+    def __init__(self, llm_client: LLMClient, logger: logging.Logger = None):
+        self.llm_client = llm_client
+        self.logger = logger or logging.getLogger(__name__)
+        self.logger.info("初始化 CoRefResolver (Level 1 指代消解)")
+
+    def resolve(self, query: str, context: str) -> str:
+        """将查询中的指代词替换为上下文中的具体实体。
+
+        Args:
+            query:   含指代词的用户查询（如"哪款价格最低？"）
+            context: 近期对话历史（短期记忆摘要）
+
+        Returns:
+            消解后的独立完整问题；若无需修改则原样返回。
+        """
+        # 只取最近上下文，避免 prompt 过长
+        ctx_snippet = context[-400:] if len(context) > 400 else context
+
+        prompt = f"""你是一个指代消解工具。
+
+对话历史（最近）：
+{ctx_snippet}
+
+用户提问：{query}
+
+任务：如果提问中含有"这/那/它/上面提到的/哪款"等指代词，请将其替换为对话历史中的具体实体，\
+输出一个完整独立的问题。如果没有指代词，直接原样输出问题。
+
+只输出处理后的问题，不要任何解释。"""
+
+        try:
+            resolved = self.llm_client.generate(
+                prompt=prompt, temperature=0.1
+            ).strip()
+            # 过滤掉明显的无效输出
+            if not resolved or len(resolved) > len(query) * 5:
+                return query
+            return resolved
+        except Exception as e:
+            self.logger.warning(f"[CoRefResolver] 失败，使用原始查询: {e}")
+            return query

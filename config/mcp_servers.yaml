@@ -6,7 +6,7 @@ servers:
   - name: "order"
     enabled: true
     endpoint: "http://localhost:8000/sse"
-    description: "用户的创建、修改；操作用户的银行卡和地址等；操作订单"
+    description: "智能购物平台核心服务：商品搜索、用户管理（注册/查询/修改）、收货地址管理、银行卡管理、订单管理（创建/查询/列表）"
   # 示例: 天气服务
   - name: "weather"
     enabled: false

@@ -6,8 +6,9 @@
 """
 import json
 import logging
-from typing import Dict, Any, Optional
 from enum import Enum
+from typing import Dict, Any, Optional
+
 from observability import get_tracer
 
 
@@ -163,11 +164,17 @@ class IntentRecognizer:
         if not self.llm_client:
             return None
 
-        prompt = f"""你是一个意图识别与任务分析助手。分析用户输入，一次性判断：意图类型、任务复杂度。
+        tools_section = ""
+        if self.mcp_manager:
+            tools = self._get_tools_description()
+            if tools:
+                tools_section = f"\n**可用工具列表（仅 mcp_execute 时使用）**:\n{tools}\n"
 
-注意：你只负责识别意图和复杂度，不需要选择具体工具，工具选择由后续的任务规划器负责。
+        prompt = f"""你是智能购物平台的意图识别助手。分析用户输入，一次性判断：意图类型、任务复杂度。
 
-对话历史：
+注意：当 intent_type 为 "mcp_execute" 时，请从"可用工具列表"中选择最匹配的工具名。
+
+{tools_section}对话历史：
 {context}
 
 用户输入: {query}
@@ -175,43 +182,44 @@ class IntentRecognizer:
 请从以下维度分析：
 
 **一、意图类型** (intent_type):
-- "simple_chat": 仅用于与公司/业务无关的纯闲聊、通用常识（如"今天天气怎么样"、"1+1等于几"）
-- "rag_simple": 涉及公司内部信息的问题，必须走知识库检索。包括但不限于：考勤、打卡、请假、薪酬、福利、晋升、报销、入职、离职、制度、规定、流程、手册等。知识库中已收录《员工人事手册》等公司文档。
-- "rag_advanced": 需要深度检索的复杂问题（多文档综合、对比分析、多角度总结）
-- "mcp_execute": 用户要求执行某个业务操作（创建/修改/删除/查询用户、订单、商品等）
-- "mcp_ask_info": 用户询问某个操作需要什么参数信息（如"下订单需要什么"）
+- "simple_chat": 与购物/商品无关的纯闲聊、通用常识（如"今天天气怎么样"、"你好"）
+- "rag_simple": 商品咨询——用户询问商品信息、参数、特点、价格、库存、使用场景等。知识库中已收录所有在售商品的详细描述、评测、FAQ和选购指南。
+- "rag_advanced": 复杂商品分析——多商品对比、跨类目选购方案、预算组合推荐等
+- "mcp_execute": 业务操作——下单/购买、查询订单、创建/修改用户信息、管理收货地址、管理银行卡、搜索商品等
+- "mcp_ask_info": 询问操作所需信息（如"下单需要准备什么"、"怎么添加地址"）
 
 **⚠️ simple_chat 与 rag_simple 的核心区别**:
-- 如果答案可能存在于公司知识库（制度、流程、手册等）→ 必须选 rag_simple
-- 只有完全与公司/业务无关的通用问题 → 才选 simple_chat
-- 拿不准时，优先选 rag_simple（宁可多查一次知识库，也不要错过公司文档）
+- 凡是涉及商品（手机、电脑、耳机、平板、家电、运动鞋、手表等）→ 必须选 rag_simple 或 rag_advanced
+- 只有完全与购物无关的通用问题 → 才选 simple_chat
+- 拿不准时，优先选 rag_simple
 
 **二、任务复杂度** (complexity):
-- "simple": 单意图且步骤在4步以内（如：简单问答、查询用户信息、查询订单）
-- "medium": 单意图4-7步（如：先查询再操作、下单流程、需要前置信息的多步任务）
-- "complex": 真正复杂的多阶段任务（如：跨多个业务域的联动操作、涉及多次条件分支判断、需要轮次处理多个独立实体的操作）
+- "simple": 单意图且步骤在4步以内（如：商品咨询、查询订单、查询用户信息）
+- "medium": 单意图4-7步（如：推荐+下单、查商品→查用户→下单→汇总）
+- "complex": 多阶段任务（如：跨类目组合推荐→用户选择→逐一下单→汇总）
 
-**复杂度校准示例（极其重要，严格参考）**:
-- "查询我的订单" → simple（单步查询）
+**复杂度校准示例（严格参考）**:
+- "iPhone 15 Pro Max怎么样" → simple（商品咨询，rag_simple）
+- "推荐一款5000元左右的手机" → simple（rag_simple或rag_advanced）
+- "手机和耳机哪个组合好" → simple（rag_advanced，多商品对比但无操作）
+- "查询我的订单" → simple（单步查询，mcp_execute）
 - "买两部小米14 Ultra" → medium（查商品→查用户信息→下单→汇总 = 4步）
-- "查询用户信息然后下单" → medium（查询→下单 = 2-4步）
-- "先查库存，如果有货就下单，然后查物流，最后通知客户" → complex（多阶段+条件判断）
-- “下单”类操作无论买几件商品，只要是一次性批量下单，复杂度最多为 medium
+- "帮我推荐一套数码装备然后下单" → medium（推荐→确认→下单）
+- "帮我比较三款手机，选最好的那款下单，再配一副耳机" → complex（多阶段）
 
 **三、关键判断规则**:
 - 包含"然后"、"接着"、"先...再..."等多步骤连接词 → 复杂度至少medium
-- 同时涉及查询+操作（如"查询XXX然后修改"）→ 复杂度至少medium
-- 涉及条件判断、多实体操作、需要验证的任务 → complex
-- 问题涉及公司制度、人事、考勤、薪酬、福利、流程等 → rag_simple
-- 问题涉及产品文档、技术规格、项目文档等 → rag相关
+- 同时涉及推荐+购买操作 → 复杂度至少medium
+- 纯商品咨询/推荐（无购买操作）→ 通常simple
+- 涉及条件判断、多实体操作 → complex
 
 **四、置信度校准规则**:
 - 用户意图清晰明确 → confidence > 0.8
-- 用户意图基本明确但细节不完整 → confidence 0.5-0.8
+- 用户意图基本明确但细节不完整（如"推荐手机"未说预算）→ 0.5-0.8
 - 用户意图模糊 → confidence < 0.5
 
 返回JSON格式:
-{{"intent_type": "...", "complexity": "simple/medium/complex", "confidence": 0.0-1.0, "requires_rag": true/false, "requires_mcp": true/false, "reason": "判断原因"}}
+{{"intent_type": "...", "complexity": "simple/medium/complex", "confidence": 0.0-1.0, "requires_rag": true/false, "requires_mcp": true/false, "reason": "判断原因", "goal": "用户核心目标（一句话）", "constraints": ["明确约束1", "明确约束2"], "tool_name": "工具名或null（仅intent_type=mcp_execute时填写，必须与可用工具列表完全匹配）"}}
 
 只返回JSON，不要其他说明。"""
 
@@ -226,6 +234,9 @@ class IntentRecognizer:
             requires_rag = result.get('requires_rag', False)
             requires_mcp = result.get('requires_mcp', False)
             reason = result.get('reason', '')
+            # 新增：缓存 goal 和 constraints 到 intent_result（供 GoalUnderstanding 直接使用）
+            goal = result.get('goal', '')
+            constraints = result.get('constraints', [])
 
             # 映射意图类型和复杂度
             intent_type = self._map_intent_type(intent_type_str)
@@ -235,16 +246,25 @@ class IntentRecognizer:
             if intent_type in (IntentType.MCP_EXECUTE, IntentType.MCP_ASK_INFO):
                 requires_mcp = True
 
-            # tool_name 不在意图识别阶段确定，留给 TaskPlanner/子Agent
-            return IntentResult(
+            # mcp_execute 时尝试从 LLM 返回中提取工具名
+            tool_name_from_llm = result.get('tool_name') or None
+            if tool_name_from_llm and not self._validate_tool(tool_name_from_llm):
+                self.logger.debug(f"LLM返回的工具名 '{tool_name_from_llm}' 不在可用列表中，忽略")
+                tool_name_from_llm = None
+
+            result_obj = IntentResult(
                 intent_type=intent_type,
                 complexity=complexity,
                 confidence=confidence,
-                tool_name=None,
+                tool_name=tool_name_from_llm,
                 reason=reason,
                 requires_rag=requires_rag,
                 requires_mcp=requires_mcp,
             )
+            # 将 goal 和 constraints 附加到 result_obj，供 GoalUnderstanding 使用
+            result_obj._goal = goal
+            result_obj._constraints = constraints if isinstance(constraints, list) else []
+            return result_obj
 
         except Exception as e:
             self.logger.warning(f"LLM意图识别失败: {e}")
@@ -265,16 +285,17 @@ class IntentRecognizer:
         complexity = self._heuristic_complexity(query_lower)
 
         # 检查是否包含RAG特征（公司/业务领域关键词优先级最高）
-        company_keywords = [
-            '公司', '制度', '规定', '流程', '手册', '政策',
-            '考勤', '打卡', '请假', '休假', '年假', '病假', '调休', '加班',
-            '薪酬', '薪资', '工资', '福利', '社保', '公积金', '报销',
-            '入职', '离职', '转正', '晋升', '绩效', '考核',
-            '员工', '人事', 'hr',
+        shopping_keywords = [
+            '商品', '产品', '价格', '多少钱', '售价', '库存', '有货',
+            '推荐', '哪款', '哪个好', '对比', '区别', '值得买', '怎么选',
+            '手机', '电脑', '笔记本', '耳机', '平板', '家电', '运动鞋', '手表',
+            '下单', '购买', '买', '订单', '发货', '退换', '售后', '保修',
+            '参数', '配置', '屏幕', '续航', '降噪', '芯片', '性价比',
+            'iphone', 'macbook', 'airpods', 'ipad', '华为', '小米', '索尼', '戴森',
         ]
-        rag_keywords = ['什么', '如何', '为什么', '怎么', '查询', '查找', '搜索', '文档', '知识']
-        has_company_hint = any(kw in query_lower for kw in company_keywords)
-        has_rag_hint = has_company_hint or any(kw in query_lower for kw in rag_keywords)
+        rag_keywords = ['什么', '如何', '为什么', '怎么', '好不好', '怎么样', '适合']
+        has_shopping_hint = any(kw in query_lower for kw in shopping_keywords)
+        has_rag_hint = has_shopping_hint or any(kw in query_lower for kw in rag_keywords)
 
         if has_rag_hint:
             is_complex_query = len(query) > 30 or query.count('？') + query.count('?') > 1
