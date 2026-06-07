@@ -45,6 +45,7 @@ class DynamicSubAgent(SubAgentBase):
         context_manager=None,
         config: Dict[str, Any] = None,
         logger: logging.Logger = None,
+        task_planner=None,
     ):
         self.ALLOWED_TOOLS = tools or []
         super().__init__(
@@ -58,6 +59,7 @@ class DynamicSubAgent(SubAgentBase):
         self.injected_context = context
         self.timeout = timeout
         self.context_manager = context_manager
+        self.task_planner = task_planner
         self._log_tag = f"[DynAgent-{agent_id[:8]}]"
 
     async def handle_task(self, task: Dict[str, Any]) -> Dict[str, Any]:
@@ -86,13 +88,13 @@ class DynamicSubAgent(SubAgentBase):
 
             # 判断是否需要工具调用
             if self.ALLOWED_TOOLS and self.mcp_manager:
-                result_text = await self._execute_with_tools(
-                    sub_task_desc, full_context
-                )
+                if self.task_planner:
+                    # 优先走 TaskPlanner（支持 Plan-and-Execute）
+                    result_text = await self._execute_with_task_planner(sub_task_desc, full_context)
+                else:
+                    result_text = await self._execute_with_tools(sub_task_desc, full_context)
             else:
-                result_text = self._execute_reasoning_only(
-                    sub_task_desc, full_context
-                )
+                result_text = self._execute_reasoning_only(sub_task_desc, full_context)
 
             # 将详细结果压缩为"总结邮件"
             summary = self._compress_to_summary(sub_task_desc, result_text)
@@ -150,7 +152,7 @@ class DynamicSubAgent(SubAgentBase):
             logger=self.logger,
         )
         cfg = ReActConfig(
-            max_iterations=3,      # 子Agent 内部轮次保持较小
+            max_iterations=getattr(self, '_max_iterations', 3),
             temperature=0.3,
             allowed_tools=self.ALLOWED_TOOLS if self.ALLOWED_TOOLS else None,
             enable_rag=False,      # 子Agent 不开放 RAG
@@ -158,7 +160,7 @@ class DynamicSubAgent(SubAgentBase):
         )
 
         # UnifiedReActExecutor.execute 是同步的，在 async 上下文中用 run_in_executor
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(
             None,
             lambda: executor.execute(
@@ -170,6 +172,41 @@ class DynamicSubAgent(SubAgentBase):
             )
         )
         return result
+
+    async def _execute_with_task_planner(self, task_desc: str, context: str) -> str:
+        """使用 TaskPlanner 执行（支持 Plan-and-Execute / ReAct）"""
+        import asyncio
+        from .intent_recognizer import IntentResult, IntentType, TaskComplexity
+
+        # 根据任务描述推断意图和复杂度
+        intent_type, tool_name, complexity = self._infer_intent(task_desc)
+        intent = IntentResult(
+            intent_type=intent_type,
+            complexity=complexity,
+            tool_name=tool_name,
+            requires_mcp=(intent_type == IntentType.MCP_EXECUTE),
+        )
+
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            None,
+            lambda: self.task_planner.execute(
+                user_query=task_desc,
+                intent=intent,
+                context=context,
+                long_term_context="",
+                verbose=False,
+            )
+        )
+        return result
+
+    def _infer_intent(self, task_desc: str):
+        """根据任务描述推断意图类型、工具名、复杂度（委托公共函数，保持与 Orchestrator 一致）"""
+        from .intent_utils import infer_intent_from_desc
+        return infer_intent_from_desc(
+            desc=task_desc.lower(),
+            allowed_tools=self.ALLOWED_TOOLS or None,
+        )
 
     def _execute_reasoning_only(self, task_desc: str, context: str) -> str:
         """纯推理模式（无工具调用）"""

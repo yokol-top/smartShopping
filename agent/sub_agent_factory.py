@@ -19,87 +19,19 @@
 
 import asyncio
 import logging
+import os
 import time
 import uuid
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
+
+import yaml as _yaml
 
 from utils import LLMClient
+from utils.logger import get_trace_id, set_trace_id
+from .circuit_breaker import CircuitBreaker
 from .dynamic_sub_agent import DynamicSubAgent
+from .exceptions import NeedUserInputException
 from .task_state import SubTask, SubAgentResult
-
-
-class CircuitBreaker:
-    """熔断器
-
-    连续失败达到阈值后进入OPEN状态，暂停委派。
-    经过冷却期后进入HALF_OPEN状态，允许少量试探。
-    试探成功则恢复CLOSED状态。
-
-    参考企业级方案：Netflix Hystrix / resilience4j
-    """
-
-    CLOSED = "closed"         # 正常工作
-    OPEN = "open"             # 熔断中（拒绝委派）
-    HALF_OPEN = "half_open"   # 试探中
-
-    def __init__(
-        self,
-        failure_threshold: int = 3,
-        cooldown_seconds: float = 60.0,
-        logger: logging.Logger = None,
-    ):
-        self.failure_threshold = failure_threshold
-        self.cooldown_seconds = cooldown_seconds
-        self.logger = logger or logging.getLogger(__name__)
-
-        self._state = self.CLOSED
-        self._failure_count = 0
-        self._last_failure_time = 0.0
-        self._success_count_in_half_open = 0
-
-    @property
-    def state(self) -> str:
-        # 自动从OPEN转HALF_OPEN（冷却期过后）
-        if self._state == self.OPEN:
-            if time.time() - self._last_failure_time > self.cooldown_seconds:
-                self._state = self.HALF_OPEN
-                self._success_count_in_half_open = 0
-                self.logger.info("[CircuitBreaker] OPEN → HALF_OPEN（冷却期结束）")
-        return self._state
-
-    def allow_request(self) -> bool:
-        """是否允许委派"""
-        s = self.state
-        if s == self.CLOSED:
-            return True
-        if s == self.HALF_OPEN:
-            return True  # 允许试探
-        return False  # OPEN状态拒绝
-
-    def record_success(self):
-        """记录成功"""
-        if self._state == self.HALF_OPEN:
-            self._success_count_in_half_open += 1
-            if self._success_count_in_half_open >= 2:
-                self._state = self.CLOSED
-                self._failure_count = 0
-                self.logger.info("[CircuitBreaker] HALF_OPEN → CLOSED（试探成功）")
-        else:
-            self._failure_count = max(0, self._failure_count - 1)
-
-    def record_failure(self):
-        """记录失败"""
-        self._failure_count += 1
-        self._last_failure_time = time.time()
-
-        if self._state == self.HALF_OPEN:
-            self._state = self.OPEN
-            self.logger.warning("[CircuitBreaker] HALF_OPEN → OPEN（试探失败）")
-        elif self._failure_count >= self.failure_threshold:
-            self._state = self.OPEN
-            self.logger.warning(
-                f"[CircuitBreaker] CLOSED → OPEN（连续失败{self._failure_count}次）"
-            )
 
 
 class SubAgentFactory:
@@ -119,12 +51,14 @@ class SubAgentFactory:
         config: Dict[str, Any] = None,
         logger: logging.Logger = None,
         context_manager=None,
+        task_planner=None,
     ):
         self.llm_client = llm_client
         self.mcp_manager = mcp_manager
         self.config = config or {}
         self.logger = logger or logging.getLogger(__name__)
         self.context_manager = context_manager
+        self.task_planner = task_planner
 
         # 熔断器
         cb_config = self.config.get('orchestrator', {}).get('circuit_breaker', {})
@@ -133,6 +67,21 @@ class SubAgentFactory:
             cooldown_seconds=cb_config.get('cooldown_seconds', 60.0),
             logger=self.logger,
         )
+        self._typed_circuit_breakers: Dict[str, CircuitBreaker] = {}
+
+        # 加载 Agent 模板配置
+        templates_path = os.path.join(
+            os.path.dirname(os.path.dirname(__file__)),
+            'config', 'agent_templates.yaml'
+        )
+        self._agent_templates: dict = {}
+        try:
+            with open(templates_path, 'r', encoding='utf-8') as f:
+                data = _yaml.safe_load(f)
+                self._agent_templates = data.get('templates', {})
+            self.logger.info(f"[SubAgentFactory] 加载 Agent 模板: {list(self._agent_templates.keys())}")
+        except Exception as e:
+            self.logger.warning(f"[SubAgentFactory] 模板配置加载失败（降级动态生成）: {e}")
 
         self.logger.info("[SubAgentFactory] 初始化完成")
 
@@ -171,6 +120,28 @@ class SubAgentFactory:
     # 子Agent创建
     # ================================================================
 
+    def _match_template(self, tools: List[str]) -> Optional[dict]:
+        """根据工具列表匹配最合适的 Agent 模板。
+
+        匹配规则：sub_task 的工具列表是模板 allowed_tools 的子集时视为匹配，
+        优先选择 allowed_tools 数量最少（最精确）的模板。
+        """
+        if not tools or not self._agent_templates:
+            return None
+
+        tool_set = set(tools)
+        best = None
+        best_size = float('inf')
+
+        for name, tmpl in self._agent_templates.items():
+            tmpl_tools = set(tmpl.get('allowed_tools', []))
+            if tool_set and tool_set.issubset(tmpl_tools):
+                if len(tmpl_tools) < best_size:
+                    best = tmpl
+                    best_size = len(tmpl_tools)
+
+        return best
+
     def create_agent(self, sub_task: SubTask) -> DynamicSubAgent:
         """根据SubTask配置创建动态子Agent
 
@@ -182,23 +153,40 @@ class SubAgentFactory:
         """
         agent_id = f"dyn_{sub_task.id}_{str(uuid.uuid4())[:4]}"
 
+        # 优先匹配固定模板（角色和工具更可预测）
+        template = self._match_template(sub_task.agent_tools)
+        if template:
+            role = template.get('role', sub_task.agent_role)
+            tools = template.get('allowed_tools', sub_task.agent_tools)
+            max_iter = template.get('max_iterations', 5)
+            self.logger.info(
+                f"[SubAgentFactory] 使用模板 | agent={agent_id} | "
+                f"tools={tools} | checkpoint={template.get('checkpoint_before_execute', False)}"
+            )
+        else:
+            role = sub_task.agent_role
+            tools = sub_task.agent_tools
+            max_iter = 5   # 默认值
+
         agent = DynamicSubAgent(
             agent_id=agent_id,
             llm_client=self.llm_client,
             mcp_manager=self.mcp_manager,
-            role=sub_task.agent_role,
-            tools=sub_task.agent_tools,
+            role=role,
+            tools=tools,
             context=sub_task.agent_context,
             timeout=sub_task.timeout,
             context_manager=self.context_manager,
             config=self.config,
             logger=self.logger,
+            task_planner=self.task_planner,
         )
+        # 将 max_iterations 存到 agent 以便 _execute_with_tools 使用
+        agent._max_iterations = max_iter
 
         self.logger.info(
             f"[SubAgentFactory] 创建子Agent: {agent_id} | "
-            f"角色={sub_task.agent_role[:30]} | "
-            f"工具={sub_task.agent_tools}"
+            f"角色={role[:30]} | 工具={tools}"
         )
         return agent
 
@@ -239,7 +227,8 @@ class SubAgentFactory:
             )
 
         try:
-            result = self._run_async(self._execute_async(sub_task))
+            trace_id = get_trace_id()
+            result = self._run_async(self._execute_async(sub_task, trace_id))
             if result.success:
                 cb.record_success()
                 self.circuit_breaker.record_success()   # 同时更新全局熔断器
@@ -281,7 +270,8 @@ class SubAgentFactory:
         )
 
         try:
-            results = self._run_async(self._execute_parallel_async(sub_tasks))
+            trace_id = get_trace_id()
+            results = self._run_async(self._execute_parallel_async(sub_tasks, trace_id))
             return results
         except Exception as e:
             self.logger.error(f"[SubAgentFactory] 并行执行异常: {e}")
@@ -292,8 +282,44 @@ class SubAgentFactory:
                 for st in sub_tasks
             }
 
-    async def _execute_async(self, sub_task: SubTask) -> SubAgentResult:
+    @staticmethod
+    def _capture_otel_context():
+        """捕获当前 OpenTelemetry context（用于线程传播）"""
+        try:
+            from opentelemetry import context as otel_ctx
+            return otel_ctx.get_current()
+        except ImportError:
+            return None
+
+    @staticmethod
+    def _attach_otel_context(ctx):
+        """在新线程/协程中附加 OTel context，返回 token（用于 detach）"""
+        if ctx is None:
+            return None
+        try:
+            from opentelemetry import context as otel_ctx
+            return otel_ctx.attach(ctx)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _detach_otel_context(token):
+        """释放 OTel context token"""
+        if token is None:
+            return
+        try:
+            from opentelemetry import context as otel_ctx
+            otel_ctx.detach(token)
+        except Exception:
+            pass
+
+    async def _execute_async(self, sub_task: SubTask, trace_id: str = None) -> SubAgentResult:
         """异步执行单个子任务（直接调用 handle_task，不经过 MessageBus）"""
+        # 显式恢复 trace_id：asyncio.run() 创建新事件循环时 ContextVar 不一定继承
+        if trace_id:
+            set_trace_id(trace_id)
+        # 捕获当前线程的 OTel context（在 create_agent 之前）
+        otel_ctx = self._capture_otel_context()
         agent = self.create_agent(sub_task)
         task_payload = {
             "task_id": sub_task.id,
@@ -301,6 +327,7 @@ class SubAgentFactory:
             "context": sub_task.agent_context,
         }
 
+        otel_token = self._attach_otel_context(otel_ctx)
         try:
             raw_result = await asyncio.wait_for(
                 agent.handle_task(task_payload),
@@ -317,6 +344,18 @@ class SubAgentFactory:
                 summary=raw_result.get("response", ""),
             )
 
+        except NeedUserInputException as e:
+            # 转换为特殊 SubAgentResult，Orchestrator._phase_execute() 会识别
+            self.logger.info(
+                f"[SubAgentFactory] 子任务 {sub_task.id} 需要用户输入: {e.question[:60]}"
+            )
+            return SubAgentResult(
+                task_id=sub_task.id,
+                success=False,
+                summary="",
+                error=f"__NEED_INPUT__:{e.question}",
+            )
+
         except asyncio.TimeoutError:
             self.logger.error(
                 f"[SubAgentFactory] 子任务 {sub_task.id} 执行超时 ({sub_task.timeout}s)"
@@ -328,13 +367,16 @@ class SubAgentFactory:
                 error=f"执行超时（{sub_task.timeout}秒）",
             )
 
+        finally:
+            self._detach_otel_context(otel_token)
+
     async def _execute_parallel_async(
-        self, sub_tasks: List[SubTask]
+        self, sub_tasks: List[SubTask], trace_id: str = None
     ) -> Dict[str, SubAgentResult]:
         """异步并行执行多个子任务"""
 
         async def _run_one(st: SubTask) -> tuple:
-            result = await self._execute_async(st)
+            result = await self._execute_async(st, trace_id)
             return st.id, result
 
         tasks = [_run_one(st) for st in sub_tasks]

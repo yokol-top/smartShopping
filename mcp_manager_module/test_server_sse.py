@@ -158,7 +158,7 @@ def create_user(operator_id: str, username: str, password: str,
 # --- 工具 2: 查询用户详情 ---
 @mcp.tool()
 def get_user_detail(user_id: str) -> str:
-    """根据用户ID或用户名查询用户的所有详细信息，包括角色、银行卡和地址列表。"""
+    """根据用户ID或用户名查询用户的所有详细信息，包括角色、银行卡详情和地址详情。"""
     with db_pool.get_conn() as conn:
         user_row = conn.execute(
             "SELECT user_id, username, role, phone, created_at FROM users WHERE user_id = ? OR username = ?",
@@ -299,7 +299,8 @@ def create_complex_order(
         user_id: str,
         customer_name: str,
         address_id: str,
-        card_id: str
+        card_id: str,
+        idempotency_key: Optional[str] = None
 ) -> str:
     """
     批量创建订单。支持同时为多个商品下单，每个商品创建一笔独立订单。
@@ -309,9 +310,24 @@ def create_complex_order(
     - customer_name: 收货人姓名
     - address_id: 收货地址ID
     - card_id: 支付银行卡ID
+    - idempotency_key: 幂等键，相同 key 的重复请求直接返回首次创建的订单，避免重复下单
     """
     if not _user_exists(user_id):
         return f"失败：未找到用户 {user_id}，请先确认用户ID是否正确。"
+
+    # 幂等检查：批量下单时每行存 "{key}_{pid}"，用前缀 LIKE 查询整批是否已创建
+    if idempotency_key:
+        with db_pool.get_conn() as conn:
+            existing = conn.execute(
+                "SELECT order_id, product, quantity, status "
+                "FROM orders WHERE idempotency_key LIKE ?",
+                (f"{idempotency_key}_%",)
+            ).fetchall()
+        if existing:
+            summary = f"[幂等] 该请求已处理，返回原有订单（共 {len(existing)} 笔）：\n"
+            for row in existing:
+                summary += f"  ✓ {row[0]} - 商品:{row[1]} x{row[2]} 状态:{row[3]}\n"
+            return summary
 
     # 解析商品ID列表
     pid_list = [pid.strip() for pid in product_ids.split(",") if pid.strip()]
@@ -355,11 +371,15 @@ def create_complex_order(
         for pid in pid_list:
             product = products[pid]
             order_id = f"ORD-{random.randint(1000, 9999)}"
+            # 每行用 "{key}_{pid}" 避免同一批次多商品共用同一 key 触发 UNIQUE 约束
+            row_idem_key = f"{idempotency_key}_{pid}" if idempotency_key else None
             conn.execute(
-                "INSERT INTO orders (order_id, user_id, product, quantity, customer, address, card_end, status, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO orders "
+                "(order_id, user_id, product, quantity, customer, address, card_end, status, created_at, idempotency_key) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (order_id, user_id, pid, quantity, customer_name, address_id,
-                 card_id, '已下单', datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+                 card_id, '已下单', datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                 row_idem_key)
             )
             results.append(f"✓ {order_id} - {product[1]}（¥{product[2]}）x{quantity}")
         conn.commit()
@@ -400,9 +420,9 @@ def query_order_detail(order_id: str) -> str:
     return f"订单详情: {order}"
 
 
-@mcp.tool(description="列出指定用户的所有订单列表及其基本状态，包含商品、地址、银行卡的ID和详情。")
+@mcp.tool(description="列出指定用户的所有订单列表。")
 def list_all_orders(user_id: str) -> str:
-    """列出指定用户的所有订单列表及其基本状态，包含商品、地址、银行卡的ID和详情。"""
+    """列出指定用户的所有订单列表"""
     with db_pool.get_conn() as conn:
         rows = conn.execute(
             "SELECT o.order_id, o.product, o.quantity, o.status, o.address, o.card_end, "

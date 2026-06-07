@@ -1,0 +1,38 @@
+# 关键操作的固定 Agent 配置模板
+# SubAgentFactory 创建子 Agent 时优先匹配，无匹配时动态生成
+#
+# checkpoint_before_execute: true 表示在工具执行前强制插入 NEED_INPUT，
+#   让用户有机会确认（适用于下单等不可逆操作）
+
+templates:
+  order_creation:
+    role: "你是订单创建专员。职责：先用 get_user_detail 获取用户的地址ID和银行卡ID，再调用 create_complex_order 创建订单。执行下单前必须向用户确认商品ID、地址、支付卡等关键信息。"
+    allowed_tools:
+      - create_complex_order
+      - get_user_detail
+      - search_products
+    max_iterations: 5
+    checkpoint_before_execute: true
+
+  order_query:
+    role: "你是订单查询专员。职责：用 list_all_orders 列出用户全部订单，或用 query_order_detail 查询指定订单详情，以清晰的方式呈现结果。"
+    allowed_tools:
+      - list_all_orders
+      - query_order_detail
+    max_iterations: 3
+    checkpoint_before_execute: false
+
+  product_search:
+    role: "你是商品搜索专员。职责：用 search_products 根据关键词、类目或价格区间搜索商品，提供准确的商品信息和推荐理由。"
+    allowed_tools:
+      - search_products
+    max_iterations: 3
+    checkpoint_before_execute: false
+
+  user_info:
+    role: "你是用户信息管理专员。职责：用 get_user_detail 查询用户详情（含地址和银行卡），用 update_user_profile_refined 修改用户名、地址或银行卡信息。"
+    allowed_tools:
+      - get_user_detail
+      - update_user_profile_refined
+    max_iterations: 4
+    checkpoint_before_execute: false

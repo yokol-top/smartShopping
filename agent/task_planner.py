@@ -8,6 +8,7 @@
 
 规划器接收评估器的反馈，根据反馈进行重新规划或终止。
 """
+import concurrent.futures
 import json
 import logging
 import random
@@ -16,6 +17,7 @@ from typing import Dict, Any, List, Optional
 
 from agent.intent_recognizer import IntentResult, IntentType, TaskComplexity
 from observability import get_tracer
+from .exceptions import NeedUserInputException
 from .task_evaluator import TaskEvaluator, EvalSeverity
 
 
@@ -82,6 +84,7 @@ class TaskPlanner:
         self.eval_post_enabled = eval_config.get('post_evaluation', True)
 
         self._on_step_complete = None  # 步骤完成回调（供 orchestrator 记忆提取用）
+        self.factory = None  # 由 agent.py 在 Orchestrator 创建后注入，避免循环依赖
 
         # 工具调用器（MCP/本地工具执行逻辑独立维护）
         from .tool_caller import ToolCaller
@@ -90,6 +93,7 @@ class TaskPlanner:
             mcp_manager=mcp_manager,
             tool_manager=tool_manager,
             context_manager=context_manager,
+            config=config,
             logger=logger,
         )
         self.logger.info(
@@ -120,20 +124,23 @@ class TaskPlanner:
             intent_type = intent.intent_type
             complexity = intent.complexity
 
-            if intent_type == IntentType.GREETING:
-                return self._handle_greeting()
+            try:
+                if intent_type == IntentType.GREETING:
+                    return self._handle_greeting()
 
-            if intent_type == IntentType.MCP_ASK_INFO:
-                tool_name = intent.tool_name or self._infer_tool_name(user_query, context)
-                return self._handle_ask_tool_info(tool_name, verbose)
+                if intent_type == IntentType.MCP_ASK_INFO:
+                    tool_name = intent.tool_name or self._infer_tool_name(user_query, context)
+                    return self._handle_ask_tool_info(tool_name, verbose)
 
-            if complexity == TaskComplexity.SIMPLE:
-                return self._execute_simple(user_query, intent, context, long_term_context, verbose)
-            elif complexity == TaskComplexity.MEDIUM:
-                return self._execute_plan_and_execute(user_query, intent, context, long_term_context, verbose, "medium")
-            else:
-                # 复杂任务使用分层规划
-                return self._execute_hierarchical(user_query, intent, context, long_term_context, verbose)
+                if complexity == TaskComplexity.SIMPLE:
+                    return self._execute_simple(user_query, intent, context, long_term_context, verbose)
+                elif complexity == TaskComplexity.MEDIUM:
+                    return self._execute_plan_and_execute(user_query, intent, context, long_term_context, verbose, "medium")
+                else:
+                    # 复杂任务使用分层规划
+                    return self._execute_hierarchical(user_query, intent, context, long_term_context, verbose)
+            except NeedUserInputException:
+                raise  # 向上传播，由 Orchestrator 统一捕获
 
     # ================================================================
     # 简单任务：直接执行
@@ -200,67 +207,148 @@ class TaskPlanner:
                         print(f"🔄 重新规划 ({replan_count}/{self.max_replan_attempts})...\n")
                     continue
 
-            # Step 3: 逐步执行
+            # Step 3: 按 DAG 层执行步骤（同层步骤无依赖，可并行）
             completed_steps = []
             should_replan = False
+            executed_ids: set = set()  # 已执行的 step_id，用于 remaining 计算
 
-            for i, step in enumerate(plan):
-                step.status = "running"
-                if verbose:
-                    print(f"\n{'='*50}")
-                    print(f"🔄 执行步骤 {step.step_id}/{len(plan)}: {step.description}")
-                    print(f"{'='*50}\n")
+            step_layers = self._compute_step_dag_layers(plan)
 
-                with tracer.start_span(f"task.execute_step.{step.step_id}", {
-                    "task.step_id": step.step_id,
-                    "task.step_description": step.description,
-                    "task.step_action_type": step.action_type,
-                }):
-                    step_result = self._execute_step(step, user_query, context, long_term_context, execution_history, verbose)
-                    step.result = step_result
-                    step.status = "completed"
-                    tracer.set_span_attributes({
-                        "task.step_result_preview": step_result[:300] if step_result else "",
-                        "task.step_status": "completed",
-                    })
+            for layer in step_layers:
+                if should_replan:
+                    break
 
-                record = {"step_id": step.step_id, "description": step.description,
-                          "action_type": step.action_type, "result": step_result}
-                execution_history.append(record)
-                completed_steps.append(record)
-
-                # 从步骤结果中提取实体信息（ID等）存入orchestrator记忆
-                if self._on_step_complete and step_result:
-                    try:
-                        self._on_step_complete(step_result)
-                    except Exception as e:
-                        self.logger.debug(f"步骤完成回调异常: {e}")
-
-                if verbose:
-                    self.logger.debug(f"   ✅ 结果: {step_result}\n")
-
-                # 执行中评估（可通过配置关闭以节省LLM调用）
-                if self.evaluator and self.eval_mid_enabled:
-                    remaining = [s.to_dict() for s in plan[i+1:]]
-                    mid_eval = self.evaluator.mid_evaluate(user_query, record, step_result, completed_steps, remaining)
+                if len(layer) == 1:
+                    # ── 单步串行（原有逻辑）──────────────────────────────
+                    step = layer[0]
+                    step.status = "running"
                     if verbose:
-                        self._print_eval("执行中", mid_eval)
-                    if mid_eval.should_replan:
-                        # 检查是否是缺少用户输入导致的失败（用户未提供必需参数）
-                        if self._is_missing_user_input_error(step_result):
-                            self.logger.info("检测到缺少用户必需参数，向用户请求补充信息")
-                            if verbose:
-                                print("\n❓ 检测到缺少必要信息，需要您补充...\n")
-                            return self._generate_ask_user_response(
-                                user_query, execution_history, step_result,
-                                step.description, context, long_term_context,
+                        print(f"\n{'='*50}")
+                        print(f"🔄 执行步骤 {step.step_id}/{len(plan)}: {step.description}")
+                        print(f"{'='*50}\n")
+
+                    with tracer.start_span(f"task.execute_step.{step.step_id}", {
+                        "task.step_id": step.step_id,
+                        "task.step_description": step.description,
+                        "task.step_action_type": step.action_type,
+                    }):
+                        step_result = self._execute_step(
+                            step, user_query, context, long_term_context, execution_history, verbose
+                        )
+                        step.result = step_result
+                        step.status = "completed"
+                        tracer.set_span_attributes({
+                            "task.step_result_preview": step_result[:300] if step_result else "",
+                            "task.step_status": "completed",
+                        })
+
+                    record = {"step_id": step.step_id, "description": step.description,
+                              "action_type": step.action_type, "result": step_result}
+                    execution_history.append(record)
+                    completed_steps.append(record)
+                    executed_ids.add(step.step_id)
+
+                    if self._on_step_complete and step_result:
+                        try:
+                            self._on_step_complete(step_result)
+                        except Exception as e:
+                            self.logger.debug(f"步骤完成回调异常: {e}")
+
+                    if verbose:
+                        self.logger.debug(f"   ✅ 结果: {step_result}\n")
+
+                    # 执行中评估
+                    if self.evaluator and self.eval_mid_enabled:
+                        remaining = [s.to_dict() for s in plan if s.step_id not in executed_ids]
+                        mid_eval = self.evaluator.mid_evaluate(
+                            user_query, record, step_result, completed_steps, remaining
+                        )
+                        if verbose:
+                            self._print_eval("执行中", mid_eval)
+                        if mid_eval.should_replan:
+                            if self._is_missing_user_input_error(step_result):
+                                self.logger.info("检测到缺少用户必需参数，向用户请求补充信息")
+                                if verbose:
+                                    print("\n❓ 检测到缺少必要信息，需要您补充...\n")
+                                return self._generate_ask_user_response(
+                                    user_query, execution_history, step_result,
+                                    step.description, context, long_term_context,
+                                )
+                            replan_count += 1
+                            if replan_count > self.max_replan_attempts:
+                                break
+                            context += (
+                                f"\n[执行中反馈] 步骤{step.step_id}: "
+                                f"{self._sanitize_feedback(mid_eval.message, mid_eval.suggestions)}"
                             )
-                        replan_count += 1
-                        if replan_count > self.max_replan_attempts:
+                            should_replan = True
                             break
-                        context += f"\n[执行中反馈] 步骤{step.step_id}: {self._sanitize_feedback(mid_eval.message, mid_eval.suggestions)}"
-                        should_replan = True
-                        break
+
+                else:
+                    # ── 多步并行（同波次内无依赖关系）────────────────────
+                    ids = [s.step_id for s in layer]
+                    if verbose:
+                        print(f"\n{'='*50}")
+                        print(f"⚡ 并行执行步骤 {ids}")
+                        print(f"{'='*50}\n")
+
+                    # 波次开始时的历史快照（只读，不含本波次结果）
+                    history_snapshot = list(execution_history)
+
+                    def _run_step(s, _snap=history_snapshot):
+                        return self._execute_step(
+                            s, user_query, context, long_term_context, _snap, False
+                        )
+
+                    with tracer.start_span(f"task.execute_wave.parallel",
+                                           {"task.wave_step_ids": str(ids)}):
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=len(layer)) as pool:
+                            futures = [pool.submit(_run_step, s) for s in layer]
+                            wave_results = []
+                            for step, fut in zip(layer, futures):
+                                try:
+                                    result = fut.result(timeout=90)
+                                except Exception as e:
+                                    self.logger.error(f"步骤 {step.step_id} 并行执行异常: {e}")
+                                    result = f"步骤执行失败: {e}"
+                                step.result = result
+                                step.status = "completed"
+                                wave_results.append((step, result))
+
+                    # 批量追加结果（保持 step_id 升序）
+                    wave_results.sort(key=lambda x: x[0].step_id)
+                    for step, result in wave_results:
+                        record = {"step_id": step.step_id, "description": step.description,
+                                  "action_type": step.action_type, "result": result}
+                        execution_history.append(record)
+                        completed_steps.append(record)
+                        executed_ids.add(step.step_id)
+                        if verbose:
+                            self.logger.debug(f"   ✅ 步骤{step.step_id}: {result[:200]}\n")
+                        if self._on_step_complete and result:
+                            try:
+                                self._on_step_complete(result)
+                            except Exception as e:
+                                self.logger.debug(f"步骤完成回调异常: {e}")
+
+                    # 波次结束后统一执行中评估（对最后一个结果评估，代表整体波次）
+                    if self.evaluator and self.eval_mid_enabled and wave_results:
+                        last_step, last_result = wave_results[-1]
+                        remaining = [s.to_dict() for s in plan if s.step_id not in executed_ids]
+                        mid_eval = self.evaluator.mid_evaluate(
+                            user_query, completed_steps[-1], last_result, completed_steps, remaining
+                        )
+                        if verbose:
+                            self._print_eval("执行中（波次结束）", mid_eval)
+                        if mid_eval.should_replan:
+                            replan_count += 1
+                            if replan_count > self.max_replan_attempts:
+                                break
+                            context += (
+                                f"\n[执行中反馈] 步骤{last_step.step_id}: "
+                                f"{self._sanitize_feedback(mid_eval.message, mid_eval.suggestions)}"
+                            )
+                            should_replan = True
 
             if should_replan:
                 if verbose:
@@ -294,78 +382,142 @@ class TaskPlanner:
     # 复杂任务：分层规划
     # ================================================================
     def _execute_hierarchical(self, user_query, intent, context, long_term_context, verbose):
-        """复杂任务的分层规划执行
+        """复杂任务的分层规划执行（DAG 并行版）
 
         流程：
-        1. 先规划几个大的阶段（高层计划）
-        2. 每个阶段按照中等任务的Plan and Execute处理
-        3. 汇总所有阶段结果生成最终答案
+        1. 生成高层阶段计划（含 depends_on 依赖声明）
+        2. 拓扑排序得到执行波次（DAG layer）
+        3. 每个波次内的独立阶段通过 SubAgentFactory 并行执行
+           无 factory 或单阶段波次则直接串行执行
+        4. 汇总所有阶段结果生成最终答案
         """
+        from .task_state import SubTask, DelegationReason
+
         tracer = get_tracer()
-        self.logger.info("复杂任务 - 分层规划模式")
+        self.logger.info("复杂任务 - 分层规划模式（DAG 并行）")
         if verbose:
             print(f"\n🧠 复杂任务 - 分层规划模式\n")
 
-        # Step 1: 生成高层阶段计划
+        # Step 1: 生成高层阶段计划（含依赖关系）
         with tracer.start_span("task.hierarchical.generate_phases"):
             phases = self._generate_high_level_phases(user_query, intent, context, long_term_context)
             tracer.set_span_attributes({"task.phases_count": len(phases)})
 
+        # Step 2: 计算 DAG 执行层
+        dag_layers = self._compute_dag_layers(phases)
+        parallel_count = sum(1 for layer in dag_layers if len(layer) > 1)
+
         if verbose:
-            print(f"📋 分层计划（{len(phases)} 个阶段）:")
-            for i, phase in enumerate(phases, 1):
-                print(f"   阶段 {i}: {phase['description']}")
+            print(f"📋 分层计划（{len(phases)} 个阶段，{len(dag_layers)} 波次，{parallel_count} 波次可并行）:")
+            for wave_idx, layer in enumerate(dag_layers, 1):
+                for phase in layer:
+                    deps = phase.get("depends_on", [])
+                    tag = " [并行]" if len(layer) > 1 else ""
+                    dep_str = f" ← 依赖{deps}" if deps else ""
+                    print(f"   波次{wave_idx}{tag} 阶段{phase['phase_id']}: {phase['description']}{dep_str}")
             print()
 
-        # Step 2: 逐阶段执行（每个阶段视为中等任务）
-        all_phase_results = []
+        all_phase_results: List[Dict] = []
         accumulated_context = context
+        all_tool_names = self._get_all_tool_names()
 
-        for i, phase in enumerate(phases):
-            phase_desc = phase['description']
-            if verbose:
-                print(f"\n{'='*60}")
-                print(f"🔷 阶段 {i+1}/{len(phases)}: {phase_desc}")
-                print(f"{'='*60}\n")
+        # Step 3: 按 DAG 层执行
+        for wave_idx, layer in enumerate(dag_layers):
+            # 构建前置阶段摘要（供本波次所有阶段共用）
+            completed_summary = ""
+            if all_phase_results:
+                parts = ["\n[已完成的阶段（不要重复执行）]"]
+                for pr in all_phase_results:
+                    parts.append(f"- 阶段{pr['phase_id']}({pr['description']}): {pr['result'][:300]}")
+                completed_summary = "\n".join(parts)
 
-            with tracer.start_span(f"task.hierarchical.phase.{i+1}", {
-                "task.phase_id": i + 1,
-                "task.phase_description": phase_desc,
-            }):
-                # 构建阶段查询，包含已完成阶段的摘要，避免重复执行
-                completed_summary = ""
-                if all_phase_results:
-                    completed_parts = ["\n[已完成的阶段（不要重复执行）]"]
-                    for pr in all_phase_results:
-                        completed_parts.append(
-                            f"- 阶段{pr['phase_id']}({pr['description']}): {pr['result'][:300]}"
+            can_parallel = len(layer) > 1 and self.factory is not None
+
+            if can_parallel:
+                # ── 并行波次：通过 SubAgentFactory 并发执行 ──────────────
+                if verbose:
+                    ids = [p["phase_id"] for p in layer]
+                    print(f"\n{'='*60}")
+                    print(f"⚡ 波次 {wave_idx+1}（并行）: 阶段 {ids} 同时启动")
+                    print(f"{'='*60}\n")
+
+                sub_tasks = []
+                for phase in layer:
+                    phase_query = (
+                        f"[阶段 {phase['phase_id']}] {phase['description']}\n\n"
+                        f"（原始用户请求：{user_query}）"
+                        f"{completed_summary}"
+                    )
+                    st = SubTask(
+                        id=f"phase_{phase['phase_id']}",
+                        description=phase_query,
+                        assigned_to="sub_agent",
+                        delegation_reason=DelegationReason.PARALLELIZABLE.value,
+                        depends_on=[],  # 层内已无依赖
+                        agent_role="智能购物规划助手，负责完成分配的阶段任务",
+                        agent_tools=all_tool_names,
+                        agent_context=accumulated_context,
+                        timeout=90.0,
+                    )
+                    sub_tasks.append((phase, st))
+
+                with tracer.start_span(f"task.hierarchical.wave.{wave_idx+1}.parallel",
+                                       {"task.wave_size": len(sub_tasks)}):
+                    results_map = self.factory.execute_subtasks_parallel(
+                        [st for _, st in sub_tasks]
+                    )
+
+                for phase, st in sub_tasks:
+                    r = results_map.get(st.id)
+                    result_text = (r.summary if r and r.success
+                                   else (r.error if r else "子Agent执行失败"))
+                    all_phase_results.append({
+                        "phase_id": phase["phase_id"],
+                        "description": phase["description"],
+                        "result": result_text,
+                    })
+                    accumulated_context += (
+                        f"\n[阶段{phase['phase_id']}结果] {phase['description']}: {result_text[:500]}"
+                    )
+                    tracer.set_span_attributes({
+                        f"task.phase_{phase['phase_id']}_result_preview": result_text[:200],
+                    })
+
+            else:
+                # ── 串行波次：主 Agent 直接执行（单阶段 or 无 factory 兜底）──
+                for phase in layer:
+                    phase_desc = phase["description"]
+                    if verbose:
+                        print(f"\n{'='*60}")
+                        print(f"🔷 阶段 {phase['phase_id']}/{len(phases)}: {phase_desc}")
+                        print(f"{'='*60}\n")
+
+                    with tracer.start_span(f"task.hierarchical.phase.{phase['phase_id']}", {
+                        "task.phase_id": phase["phase_id"],
+                        "task.phase_description": phase_desc,
+                    }):
+                        phase_query = (
+                            f"[阶段 {phase['phase_id']}] {phase_desc}\n\n"
+                            f"（原始用户请求：{user_query}）"
+                            f"{completed_summary}"
                         )
-                    completed_summary = "\n".join(completed_parts)
+                        phase_result = self._execute_plan_and_execute(
+                            phase_query, intent, accumulated_context,
+                            long_term_context, verbose, "medium"
+                        )
+                        all_phase_results.append({
+                            "phase_id": phase["phase_id"],
+                            "description": phase_desc,
+                            "result": phase_result,
+                        })
+                        accumulated_context += (
+                            f"\n[阶段{phase['phase_id']}结果] {phase_desc}: {phase_result[:500]}"
+                        )
+                        tracer.set_span_attributes({
+                            "task.phase_result_preview": phase_result[:300],
+                        })
 
-                phase_query = (
-                    f"[阶段 {i+1}] {phase_desc}\n\n"
-                    f"（原始用户请求：{user_query}）"
-                    f"{completed_summary}"
-                )
-                phase_result = self._execute_plan_and_execute(
-                    phase_query, intent, accumulated_context, long_term_context,
-                    verbose, "medium"
-                )
-
-                all_phase_results.append({
-                    "phase_id": i + 1,
-                    "description": phase_desc,
-                    "result": phase_result,
-                })
-
-                # 将阶段结果追加到上下文，供后续阶段参考
-                accumulated_context += f"\n[阶段{i+1}结果] {phase_desc}: {phase_result[:500]}"
-
-                tracer.set_span_attributes({
-                    "task.phase_result_preview": phase_result[:300],
-                })
-
-        # Step 3: 汇总所有阶段结果
+        # Step 4: 汇总所有阶段结果
         if verbose:
             print(f"\n{'='*60}")
             print(f"📊 汇总所有阶段结果")
@@ -377,7 +529,7 @@ class TaskPlanner:
         return final_answer
 
     def _generate_high_level_phases(self, user_query, intent, context, long_term_context):
-        """生成高层阶段计划"""
+        """生成高层阶段计划（含依赖关系，用于 DAG 并行执行）"""
         prompt_parts = []
         if long_term_context:
             prompt_parts.append(long_term_context)
@@ -389,12 +541,23 @@ class TaskPlanner:
 {context[:500]}
 
 要求：
-1. 每个阶段是一个独立的子目标
-2. 阶段之间有清晰的先后顺序
-3. 每个阶段应该是一个可以用4-7步完成的中等任务
+1. 每个阶段是一个独立的子目标，应该是一个可以用4-7步完成的中等任务
+2. 用 depends_on 字段标注依赖关系（填写前置阶段的 phase_id 列表）
+3. 没有依赖的阶段可以并行执行，请尽量识别可以并行的阶段
+
+并行判断原则：
+- 若阶段A的输入不依赖阶段B的输出 → depends_on 中不填B，可并行
+- 若阶段A必须用到阶段B的结果 → depends_on: [B.phase_id]，必须串行
+
+示例（3个阶段，前两个可并行，第三个依赖前两个）:
+[
+  {{"phase_id": 1, "description": "搜索手机类商品", "depends_on": []}},
+  {{"phase_id": 2, "description": "搜索耳机类商品", "depends_on": []}},
+  {{"phase_id": 3, "description": "综合前两步结果，生成推荐方案", "depends_on": [1, 2]}}
+]
 
 返回JSON数组格式:
-[{{"phase_id": 1, "description": "阶段描述"}}]
+[{{"phase_id": 1, "description": "阶段描述", "depends_on": []}}]
 
 只返回JSON数组。""")
 
@@ -403,10 +566,105 @@ class TaskPlanner:
                 prompt="\n".join(prompt_parts), temperature=self.react_temperature
             )
             phases = self._parse_json_safe(response, context_hint="high_level_phases")
-            return phases if phases else [{"phase_id": 1, "description": user_query}]
+            if not phases:
+                return [{"phase_id": 1, "description": user_query, "depends_on": []}]
+            # 补全缺失的 depends_on 字段
+            for p in phases:
+                p.setdefault("depends_on", [])
+            return phases
         except Exception as e:
             self.logger.error(f"生成高层阶段失败: {e}")
-            return [{"phase_id": 1, "description": user_query}]
+            return [{"phase_id": 1, "description": user_query, "depends_on": []}]
+
+    def _compute_dag_layers(self, phases: List[Dict]) -> List[List[Dict]]:
+        """对阶段 DAG 做拓扑排序，返回可并行执行的分层列表。
+
+        Returns:
+            List[List[phase_dict]] — 每个内层 list 中的阶段可并行，层间严格串行。
+        """
+        id_map = {p["phase_id"]: p for p in phases}
+        in_degree: Dict[int, int] = {p["phase_id"]: 0 for p in phases}
+        children: Dict[int, List[int]] = {p["phase_id"]: [] for p in phases}
+
+        for p in phases:
+            for dep in p.get("depends_on", []):
+                if dep in in_degree:
+                    in_degree[p["phase_id"]] += 1
+                    children[dep].append(p["phase_id"])
+
+        layers: List[List[Dict]] = []
+        ready = sorted([pid for pid, deg in in_degree.items() if deg == 0])
+
+        while ready:
+            layers.append([id_map[pid] for pid in ready])
+            next_ready: List[int] = []
+            for pid in ready:
+                for child in children[pid]:
+                    in_degree[child] -= 1
+                    if in_degree[child] == 0:
+                        next_ready.append(child)
+            ready = sorted(next_ready)
+
+        # 有环保护：剩余未排入的阶段直接追加（降级串行）
+        processed = {p["phase_id"] for layer in layers for p in layer}
+        remaining = [p for p in phases if p["phase_id"] not in processed]
+        if remaining:
+            self.logger.warning(f"[TaskPlanner] DAG 检测到环，降级串行: {[p['phase_id'] for p in remaining]}")
+            for p in remaining:
+                layers.append([p])
+
+        return layers
+
+    def _compute_step_dag_layers(self, plan: List['PlanStep']) -> List[List['PlanStep']]:
+        """对计划步骤做拓扑排序，返回可并行执行的分层列表。
+
+        与 _compute_dag_layers 逻辑相同，但操作对象是 PlanStep（依赖 step_id: int）。
+
+        Returns:
+            List[List[PlanStep]] — 同层内步骤可并行，层间严格串行。
+        """
+        id_map = {s.step_id: s for s in plan}
+        in_degree: Dict[int, int] = {s.step_id: 0 for s in plan}
+        children: Dict[int, List[int]] = {s.step_id: [] for s in plan}
+
+        for s in plan:
+            for dep in s.depends_on:
+                if dep in in_degree:
+                    in_degree[s.step_id] += 1
+                    children[dep].append(s.step_id)
+
+        layers: List[List['PlanStep']] = []
+        ready = sorted([sid for sid, deg in in_degree.items() if deg == 0])
+
+        while ready:
+            layers.append([id_map[sid] for sid in ready])
+            next_ready: List[int] = []
+            for sid in ready:
+                for child in children[sid]:
+                    in_degree[child] -= 1
+                    if in_degree[child] == 0:
+                        next_ready.append(child)
+            ready = sorted(next_ready)
+
+        # 有环保护：剩余步骤直接追加（降级串行）
+        processed = {s.step_id for layer in layers for s in layer}
+        remaining = [s for s in plan if s.step_id not in processed]
+        if remaining:
+            self.logger.warning(f"[TaskPlanner] 步骤 DAG 检测到环，降级串行: {[s.step_id for s in remaining]}")
+            for s in remaining:
+                layers.append([s])
+
+        return layers
+
+    def _get_all_tool_names(self) -> List[str]:
+        """返回 mcp_manager 中所有可用工具的名称列表（供 SubTask 白名单使用）"""
+        if not self.mcp_manager:
+            return []
+        try:
+            tools = self.mcp_manager.get_available_tools(use_cache=True)
+            return [t.get("name", "") for t in tools if t.get("name")]
+        except Exception:
+            return []
 
     def _summarize_phases(self, user_query, phase_results, context, long_term_context):
         """汇总所有阶段结果生成最终答案"""
@@ -423,7 +681,8 @@ class TaskPlanner:
 各阶段执行结果:
 {phases_summary}
 
-请基于以上所有阶段的执行结果，为用户提供完整、准确、有条理的最终回答。""")
+请基于以上所有阶段的执行结果，为用户提供完整、准确、有条理的最终回答。
+【重要】推荐商品时必须在商品名前标注商品ID，格式：[P001] 商品名 ¥价格。商品ID、订单号（ORD-XXX）、地址ID（ADDR-XXX）、银行卡ID（CARD-XXX）等关键标识符必须原样保留，不可省略。""")
 
         try:
             return self.llm_client.generate(prompt="\n".join(parts), temperature=0.5).strip()
@@ -515,9 +774,10 @@ class TaskPlanner:
 ]
 
 action_type说明:
-- search_knowledge: 从知识库检索公司内部文档/知识（注意：不是用来查询工具执行结果的，前置步骤的结果会自动传递到后续步骤）
+- search_knowledge: 仅用于检索公司商品/内容知识库（产品介绍、FAQ等通用知识）
+  ⚠️ 严禁用于查询用户私有数据（用户账户、收货地址、银行卡、订单记录等），这类数据只能用 call_mcp_tool
   action_input: {{"query": "搜索关键词"}}
-- call_mcp_tool: 调用MCP工具（必须使用上方“可用工具”列表中的工具名）
+- call_mcp_tool: 调用MCP工具（必须使用上方"可用工具"列表中的工具名，不能用 search_knowledge 作为工具名）
   action_input: {{"tool_name": "工具名", "parameters": {{...}}}}
 - generate_answer: 基于已有信息生成回答
   action_input: {{"prompt_hint": "回答要点"}}
@@ -526,10 +786,11 @@ action_type说明:
 1. 最后一步应该是generate_answer，用于整合结果
 2. 每步的action_input必须包含足够参数
 3. 依赖前置步骤结果的在depends_on中标注
-4. 前置步骤返回的ID、数据等会自动传递给后续步骤，不需要单独规划“获取ID”的步骤
+4. 前置步骤返回的ID、数据等会自动传递给后续步骤，不需要单独规划"获取ID"的步骤
 5. 只使用可用工具列表中存在的工具
+6. 若可用工具中没有满足需求的工具，直接用 generate_answer 向用户说明情况，不要规划无法执行的步骤
 
-只返回JSON数组。""")
+只返回JSON数组，不要有任何解释性文字。""")
 
         prompt = "\n".join(prompt_parts)
 
@@ -561,9 +822,11 @@ action_type说明:
                     depends_on=item.get('depends_on', []),
                 ))
 
-            # 重新编号步骤ID（过滤后可能不连续）
+            # 重新编号步骤ID（过滤后可能不连续），同步更新 depends_on 引用
+            old_to_new = {s.step_id: i for i, s in enumerate(steps, 1)}
             for i, step in enumerate(steps, 1):
                 step.step_id = i
+                step.depends_on = [old_to_new[dep] for dep in step.depends_on if dep in old_to_new]
 
             return steps
         except Exception as e:
@@ -829,7 +1092,8 @@ action_type说明:
 {hist}
 
 请基于以上执行结果，为用户提供完整、准确、友好的回答。
-如果某些操作失败了，请说明情况并给出建议。""")
+如果某些操作失败了，请说明情况并给出建议。
+【重要】推荐商品时必须在商品名前标注商品ID，格式：[P001] 商品名 ¥价格。商品ID、订单号（ORD-XXX）、地址ID（ADDR-XXX）、银行卡ID（CARD-XXX）等关键标识符必须原样保留在回答中，不可省略。""")
 
         try:
             return self.llm_client.generate(prompt="\n".join(parts), temperature=0.5).strip()
@@ -843,7 +1107,7 @@ action_type说明:
         parts = []
         if long_term_context:
             parts.append(long_term_context)
-        parts.append(f"用户请求: {user_query}\n当前步骤: {step_desc}\n\n前置步骤结果:\n{hist if hist else '（无）'}\n\n对话上下文: {context}\n\n请基于前置步骤的结果，完成当前步骤的任务。")
+        parts.append(f"用户请求: {user_query}\n当前步骤: {step_desc}\n\n前置步骤结果:\n{hist if hist else '（无）'}\n\n对话上下文: {context}\n\n请基于前置步骤的结果，完成当前步骤的任务。\n【重要】推荐商品时必须在商品名前标注商品ID，格式：[P001] 商品名 ¥价格。商品ID、订单号（ORD-XXX）、地址ID（ADDR-XXX）、银行卡ID（CARD-XXX）等关键标识符必须原样保留，不可省略。")
         try:
             return self.llm_client.generate(prompt="\n".join(parts), temperature=0.5).strip()
         except Exception as e:
@@ -1054,13 +1318,18 @@ action_type说明:
         except json.JSONDecodeError as first_err:
             self.logger.warning(f"JSON 首次解析失败({context_hint}): {first_err}")
 
-        # 用 LLM 修复损坏的 JSON
+        # cleaned 为空说明 LLM 返回了纯文本而非 JSON（如解释性回复），直接降级，不再修复
+        if not cleaned:
+            self.logger.warning(f"JSON 清理后为空({context_hint})，LLM 可能返回了非 JSON 文本，跳过修复")
+            raise json.JSONDecodeError("cleaned response is empty", "", 0)
+
+        # 用 LLM 修复损坏的 JSON（传入原始响应而非清理后的内容，避免信息丢失）
         try:
-            repair_prompt = f"""以下JSON格式有误，请修复并只返回修正后的JSON数组，不要有任何其他文字：
+            repair_prompt = f"""以下内容应为JSON数组格式的执行计划，但格式有误。请修复并只返回修正后的JSON数组，不要有任何其他文字：
 
-{cleaned[:1500]}
+{response[:1500]}
 
-修正后的JSON："""
+只返回JSON数组："""
             repaired = self.llm_client.generate(prompt=repair_prompt, temperature=0.1, max_tokens=1500).strip()
             repaired = self._clean_json(repaired)
             return json.loads(repaired)

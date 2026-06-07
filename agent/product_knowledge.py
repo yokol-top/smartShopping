@@ -8,6 +8,7 @@
 """
 
 import os
+import sqlite3
 import logging
 import json
 from typing import List, Dict, Any, Tuple
@@ -15,6 +16,7 @@ from typing import List, Dict, Any, Tuple
 # 商品描述素材文件路径
 _INIT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'init')
 _DESCRIPTIONS_FILE = os.path.join(_INIT_DIR, 'product_descriptions.json')
+_DB_PATH = os.path.join(os.path.dirname(_INIT_DIR), 'data', 'db', 'app.db')
 
 
 def _load_products_from_json() -> List[Dict[str, Any]]:
@@ -26,19 +28,36 @@ def _load_products_from_json() -> List[Dict[str, Any]]:
         return json.load(f)
 
 
+def _get_stock_from_db() -> Dict[str, int]:
+    """从 SQLite 数据库读取各商品的实时库存，返回 {product_id: stock} 映射"""
+    if not os.path.exists(_DB_PATH):
+        logging.warning(f"[product_knowledge] 数据库不存在，库存将显示为0: {_DB_PATH}")
+        return {}
+    try:
+        conn = sqlite3.connect(_DB_PATH, check_same_thread=False)
+        rows = conn.execute("SELECT id, stock FROM products").fetchall()
+        conn.close()
+        return {row[0]: row[1] for row in rows}
+    except Exception as e:
+        logging.warning(f"[product_knowledge] 查询数据库库存失败，库存将显示为0: {e}")
+        return {}
+
+
 def _get_seed_products() -> List[Dict[str, Any]]:
     """获取种子商品列表（兼容旧接口）"""
     raw = _load_products_from_json()
+    stock_map = _get_stock_from_db()
     products = []
     for p in raw:
         if p.get('product_id', '').startswith('P'):
+            pid = p['product_id']
             products.append({
-                'id': p['product_id'],
+                'id': pid,
                 'name': p['product_name'],
                 'category': p['category'],
                 'brand': p.get('brand', ''),
                 'price': p.get('price', 0),
-                'stock': 0,  # 实际库存从数据库获取
+                'stock': stock_map.get(pid, 0),
                 'description': '',
             })
     return products

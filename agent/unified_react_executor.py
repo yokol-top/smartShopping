@@ -20,6 +20,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Dict, Any, List, Optional
 
+from .exceptions import NeedUserInputException
+
 
 @dataclass
 class ReActConfig:
@@ -190,6 +192,7 @@ class UnifiedReActExecutor:
         if cfg.enable_rag and self.rag_engine:
             actions_desc += "- search_knowledge: {\"query\": \"搜索关键词\"}\n"
         actions_desc += "- call_mcp_tool: {\"tool_name\": \"工具名\", \"parameters\": {...}}\n"
+        actions_desc += "- need_input: {\"question\": \"需要用户提供的具体信息\"}\n"
         actions_desc += "- finish: {\"answer\": \"最终答案\"}"
 
         parts.append(f"""{role_line}
@@ -210,11 +213,12 @@ class UnifiedReActExecutor:
 2. 不要重复执行已经成功的操作。
 3. 缺少必要参数时，用 Action: finish 告知用户需要补充什么。
 4. 调用工具时必须提供工具要求的**全部必填参数**，从对话历史和已完成步骤中查找这些值。
-5. 使用 finish 时，answer 必须是**面向用户的自然语言回答**，不得直接粘贴工具的原始返回内容或 JSON。
+5. 使用 finish 时，answer 是面向用户的自然语言回答；**商品ID（P001等格式）、订单号（ORD-XXX）、地址ID（ADDR-XXX）、银行卡ID（CARD-XXX）等关键标识符必须原样保留在回答中**，不可省略，不得用名称替代ID。
+6. 若需要用户补充关键信息（如选择商品、确认地址）才能继续执行，使用 Action: need_input 告知。
 
 严格按以下格式回复：
 Thought: [总结已有结果，分析下一步]
-Action: [search_knowledge / call_mcp_tool / finish]
+Action: [search_knowledge / call_mcp_tool / need_input / finish]
 Action Input: [JSON格式]
 
 Action Input 格式：
@@ -238,6 +242,11 @@ Action Input 格式：
         """执行 ReAct 步骤的动作，返回 Observation"""
         action = step.action
         action_input = step.action_input
+
+        if action == "need_input":
+            question = action_input.get("question", "需要您提供更多信息，请补充后再试。")
+            self.logger.info(f"[UnifiedReAct] 执行中途需要用户输入: {question[:80]}")
+            raise NeedUserInputException(question)
 
         if action == "search_knowledge" and cfg.enable_rag and self.rag_engine:
             return self._exec_rag(action_input.get("query", task_desc), context)
@@ -374,6 +383,12 @@ Action Input 格式：
                     action_input = ai
                 elif ai is not None:
                     action_input = {"answer": str(ai)}
+                elif action == "finish":
+                    # LLM 有时把 answer 放在顶层而不是 action_input 里
+                    # 如: {"action":"finish","answer":"..."} 而非标准格式
+                    top_answer = parsed.get("answer") or parsed.get("Answer")
+                    if top_answer:
+                        action_input = {"answer": str(top_answer)}
                 return thought, action, action_input
             except (json.JSONDecodeError, Exception):
                 pass  # JSON 解析失败，回退到正则

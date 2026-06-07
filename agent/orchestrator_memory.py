@@ -43,6 +43,10 @@ class OrchestratorMemory:
         self._selected_plan_name: str = ""
         self._selected_products: List[Dict[str, Any]] = []
 
+        # 用户账户信息（来自 get_user_detail 可信工具结果，跨轮次持久化）
+        # 格式：{'user_id': ..., 'addresses': [...], 'cards': [...]}
+        self._user_info: Dict[str, Any] = {}
+
 
     # ================================================================
     # 写入：子Agent完成后由 orchestrator 调用
@@ -84,7 +88,7 @@ class OrchestratorMemory:
 
         选定后：
         1. 将该方案的商品列表提升为 _selected_products
-        2. 记录用户决策
+        2. 记录用户决策（同一商品集合不重复记录）
         3. 后续 get_context_for_sub_agent 仅输出已选商品，不再输出所有方案
         """
         plan = self._recommendations.get(plan_name)
@@ -92,8 +96,42 @@ class OrchestratorMemory:
             self.logger.warning(f"[OrchestratorMemory] 未找到方案: {plan_name}")
             return
 
+        new_products = plan.get("products", [])
+
+        # 若方案仅有 text 字段（简单规则降级产物），尝试从 _entities 中按名称匹配恢复商品列表
+        if not new_products and plan.get("text"):
+            plan_text = plan["text"]
+            for eid, entity in self._entities.items():
+                if not eid.startswith("P"):
+                    continue
+                entity_name = entity.get("name", "")
+                if entity_name and entity_name in plan_text:
+                    new_products.append(entity)
+            if new_products:
+                self.logger.info(
+                    f"[OrchestratorMemory] 从实体缓存恢复 {plan_name} 的商品列表: "
+                    f"{[p.get('product_id') for p in new_products]}"
+                )
+
+        new_pids = sorted(p.get("product_id", "") for p in new_products if p.get("product_id"))
+
+        # 幂等保护：同一商品集合已选中，只更新方案名，不重复记录决策
+        existing_pids = sorted(
+            p.get("product_id", "") for p in self._selected_products if p.get("product_id")
+        )
+        if self._selected_plan_name and new_pids == existing_pids:
+            # 商品相同，仅修正方案名（处理方案名被误解析的情况）
+            if self._selected_plan_name != plan_name:
+                self.logger.info(
+                    f"[OrchestratorMemory] 修正方案名: {self._selected_plan_name} → {plan_name}"
+                )
+                self._selected_plan_name = plan_name
+            else:
+                self.logger.debug(f"[OrchestratorMemory] 方案 {plan_name} 已选中，跳过重复记录")
+            return
+
         self._selected_plan_name = plan_name
-        self._selected_products = plan.get("products", [])
+        self._selected_products = new_products
 
         # 将选定商品的ID存入实体缓存
         for p in self._selected_products:
@@ -102,14 +140,13 @@ class OrchestratorMemory:
                 self._entities[pid] = p
 
         # 记录决策
-        product_ids = [p.get("product_id", "") for p in self._selected_products if p.get("product_id")]
         self.record_user_decision(
             f"选择{plan_name}",
-            {"plan": plan_name, "product_ids": product_ids, "products": self._selected_products}
+            {"plan": plan_name, "product_ids": new_pids, "products": self._selected_products}
         )
         self.logger.info(
             f"[OrchestratorMemory] 用户选择{plan_name} | "
-            f"商品IDs: {product_ids} | 商品数: {len(self._selected_products)}"
+            f"商品IDs: {new_pids} | 商品数: {len(self._selected_products)}"
         )
 
     # ================================================================
@@ -129,6 +166,18 @@ class OrchestratorMemory:
         is_selecting = any(kw in user_query for kw in [
             "选", "下单", "购买", "买", "就这个", "确认",
         ])
+
+        # 若已选定方案且用户只是确认（不含明确的方案名引用），直接返回已选方案信息
+        # 避免"确认下单"等指令被误解析为重新选择另一个方案
+        if self._selected_plan_name and is_selecting:
+            plan_keywords = ["方案一", "方案二", "方案三", "方案四"]
+            has_explicit_plan_ref = any(kw in user_query for kw in plan_keywords)
+            if not has_explicit_plan_ref:
+                # 用户在确认已选方案，直接返回选中商品信息
+                return self._format_plan(
+                    self._selected_plan_name,
+                    self._recommendations.get(self._selected_plan_name, {})
+                )
 
         # 1. 尝试匹配方案引用
         for key, plan in self._recommendations.items():
@@ -188,6 +237,21 @@ class OrchestratorMemory:
                     text = plan.get("text", "")[:150]
                     parts.append(f"{key}: {text}")
 
+        # 用户账户信息：始终输出，不受 _entities 条目数量限制
+        if self._user_info:
+            parts.append("\n[用户账户信息]")
+            parts.append(f"- user_id: {self._user_info.get('user_id', '')}")
+            parts.append(f"- username: {self._user_info.get('username', '')}")
+            for addr in self._user_info.get('addresses', []):
+                parts.append(
+                    f"- 收货地址(address_id): {addr.get('id', '')} | "
+                    f"{addr.get('location', '')} | 电话: {addr.get('phone_number', '')}"
+                )
+            for card in self._user_info.get('cards', []):
+                parts.append(
+                    f"- 银行卡(card_id): {card.get('id', '')} | {card.get('level', '')}"
+                )
+
         if self._entities:
             parts.append("\n[已知实体]")
             for eid, info in list(self._entities.items())[-5:]:
@@ -230,6 +294,19 @@ class OrchestratorMemory:
 
     def _extract_recommendations(self, response: str):
         """从售前子Agent的推荐响应中提取方案结构"""
+        # 保护现有结构：若已有 ≥2 个带 products 的完整方案，不用新结果覆写。
+        # 避免"详细介绍方案三"等单方案详情响应破坏原有三方案结构。
+        # 例外：当前方案仅包含 text 字段（简单规则降级产物），允许 LLM 覆写升级。
+        def _is_rich(plan_data: Dict[str, Any]) -> bool:
+            return bool(plan_data.get("products"))
+
+        existing_rich_count = sum(1 for p in self._recommendations.values() if _is_rich(p))
+        if existing_rich_count >= 2:
+            self.logger.debug(
+                f"[OrchestratorMemory] 已有 {existing_rich_count} 个完整方案，跳过覆写"
+            )
+            return
+
         if not self.llm_client:
             # 无 LLM 时用简单规则
             self._simple_extract_recommendations(response)
@@ -254,30 +331,50 @@ class OrchestratorMemory:
 }}
 
 要求：
-1. 保留所有商品ID（如P006）和价格
+1. 保留所有商品ID（如P006，或[P006]括号格式）和价格，product_id只取纯ID不含括号
 2. 如果回复中没有方案结构，返回空对象 {{}}
 3. 只返回JSON"""
 
         try:
             resp = self.llm_client.generate(prompt=prompt, temperature=0.1)
             resp = resp.strip()
-            if resp.startswith("```"):
-                lines = resp.split("\n")
-                resp = "\n".join(l for l in lines if not l.startswith("```"))
-
-            import json
+            # 剥离 markdown 代码块
+            if '```' in resp:
+                parts = resp.split('```')
+                for part in parts[1:]:
+                    cleaned = part.strip()
+                    if cleaned.startswith('json'):
+                        cleaned = cleaned[4:]
+                    cleaned = cleaned.strip()
+                    if cleaned.startswith('{'):
+                        resp = cleaned
+                        break
+            # 提取第一个完整 JSON 对象（LLM 可能在 JSON 后附加解释文字）
+            import re, json
+            m = re.search(r'\{.*\}', resp, re.DOTALL)
+            if m:
+                resp = m.group(0)
             plans = json.loads(resp)
-            if plans:
-                self._recommendations = plans
-                # 同时将商品信息存入实体缓存
-                for plan_name, plan_data in plans.items():
-                    for product in plan_data.get("products", []):
-                        pid = product.get("product_id", "")
-                        if pid:
-                            self._entities[pid] = product
-                self.logger.info(
-                    f"[OrchestratorMemory] 提取到 {len(plans)} 个推荐方案"
+            if not plans:
+                return
+
+            # 二次保护：新提取的方案数不能少于现有方案数（降级时放弃覆写）
+            if len(plans) < len(self._recommendations):
+                self.logger.debug(
+                    f"[OrchestratorMemory] 新提取方案数({len(plans)}) < 现有({len(self._recommendations)})，跳过覆写"
                 )
+                return
+
+            self._recommendations = plans
+            # 同时将商品信息存入实体缓存
+            for plan_name, plan_data in plans.items():
+                for product in plan_data.get("products", []):
+                    pid = product.get("product_id", "")
+                    if pid:
+                        self._entities[pid] = product
+            self.logger.info(
+                f"[OrchestratorMemory] 提取到 {len(plans)} 个推荐方案"
+            )
         except Exception as e:
             self.logger.warning(f"[OrchestratorMemory] 方案提取失败: {e}")
             self._simple_extract_recommendations(response)
@@ -372,6 +469,40 @@ class OrchestratorMemory:
                     if len(addr_val) > 5:
                         self._entities.setdefault("_address", {})["location"] = addr_val
 
+            # 解析 get_user_detail 返回的完整用户信息，存入 _user_info 持久缓存
+            # 格式: 用户信息: {'user_id': ..., 'addresses': [...], 'cards': [...]}
+            user_dict_match = re.search(r"用户信息:\s*(\{.+\})", text, re.DOTALL)
+            if user_dict_match:
+                try:
+                    import ast
+                    user_dict = ast.literal_eval(user_dict_match.group(1))
+                    if isinstance(user_dict, dict) and user_dict.get('user_id'):
+                        # 只保留下单需要的关键字段，不存储无关字段
+                        self._user_info = {
+                            'user_id': user_dict.get('user_id', ''),
+                            'username': user_dict.get('username', ''),
+                            'phone': user_dict.get('phone', ''),
+                            'addresses': user_dict.get('addresses', []),
+                            'cards': user_dict.get('cards', []),
+                        }
+                        # 同时把地址/卡 ID 写入 _entities（覆盖简单类型，带完整详情）
+                        for addr in self._user_info['addresses']:
+                            aid = addr.get('id', '')
+                            if aid:
+                                self._entities[aid] = addr
+                        for card in self._user_info['cards']:
+                            cid = card.get('id', '')
+                            if cid:
+                                self._entities[cid] = card
+                        self.logger.info(
+                            f"[OrchestratorMemory] 缓存用户信息: "
+                            f"user_id={self._user_info['user_id']}, "
+                            f"地址数={len(self._user_info['addresses'])}, "
+                            f"银行卡数={len(self._user_info['cards'])}"
+                        )
+                except (ValueError, SyntaxError):
+                    pass
+
         # 提取手机号
         phone_matches = re.findall(r'(?:电话|手机|phone|联系)[：:\s]*(1\d{10})', text)
         for phone in phone_matches:
@@ -460,3 +591,4 @@ class OrchestratorMemory:
         self._decisions.clear()
         self._selected_plan_name = ""
         self._selected_products.clear()
+        self._user_info.clear()

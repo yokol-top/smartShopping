@@ -7,7 +7,7 @@
 import json
 import logging
 from enum import Enum
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 
 from observability import get_tracer
 
@@ -41,6 +41,7 @@ class IntentResult:
         reason: str = "",
         requires_rag: bool = False,
         requires_mcp: bool = False,
+        is_plannable: bool = True,
     ):
         self.intent_type = intent_type
         self.complexity = complexity
@@ -49,6 +50,8 @@ class IntentResult:
         self.reason = reason
         self.requires_rag = requires_rag
         self.requires_mcp = requires_mcp
+        # 执行策略信号（供 Orchestrator 路由使用）
+        self.is_plannable = is_plannable
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -59,6 +62,7 @@ class IntentResult:
             "reason": self.reason,
             "requires_rag": self.requires_rag,
             "requires_mcp": self.requires_mcp,
+            "is_plannable": self.is_plannable,
         }
 
     def __repr__(self):
@@ -95,6 +99,11 @@ class IntentRecognizer:
         complexity_config = config.get('intent', {}).get('complexity', {})
         self.medium_step_threshold = complexity_config.get('medium_step_threshold', 4)
         self.complex_step_threshold = complexity_config.get('complex_step_threshold', 7)
+
+        # 自定义意图配置
+        self._custom_intents: list = config.get('custom_intents', [])
+        if self._custom_intents:
+            self.logger.info(f"加载自定义意图: {[i['name'] for i in self._custom_intents]}")
 
         self.logger.info("IntentRecognizer 初始化完成")
 
@@ -170,6 +179,14 @@ class IntentRecognizer:
             if tools:
                 tools_section = f"\n**可用工具列表（仅 mcp_execute 时使用）**:\n{tools}\n"
 
+        # 构建自定义意图描述段
+        custom_intents_section = ""
+        if self._custom_intents:
+            lines = ["**自定义意图（优先级低于内置意图）**:"]
+            for ci in self._custom_intents:
+                lines.append(f'- "{ci["name"]}": {ci["description"]}')
+            custom_intents_section = "\n" + "\n".join(lines)
+
         prompt = f"""你是智能购物平台的意图识别助手。分析用户输入，一次性判断：意图类型、任务复杂度。
 
 注意：当 intent_type 为 "mcp_execute" 时，请从"可用工具列表"中选择最匹配的工具名。
@@ -186,7 +203,7 @@ class IntentRecognizer:
 - "rag_simple": 商品咨询——用户询问商品信息、参数、特点、价格、库存、使用场景等。知识库中已收录所有在售商品的详细描述、评测、FAQ和选购指南。
 - "rag_advanced": 复杂商品分析——多商品对比、跨类目选购方案、预算组合推荐等
 - "mcp_execute": 业务操作——下单/购买、查询订单、创建/修改用户信息、管理收货地址、管理银行卡、搜索商品等
-- "mcp_ask_info": 询问操作所需信息（如"下单需要准备什么"、"怎么添加地址"）
+- "mcp_ask_info": 询问操作所需信息（如"下单需要准备什么"、"怎么添加地址"）{custom_intents_section}
 
 **⚠️ simple_chat 与 rag_simple 的核心区别**:
 - 凡是涉及商品（手机、电脑、耳机、平板、家电、运动鞋、手表等）→ 必须选 rag_simple 或 rag_advanced
@@ -218,13 +235,19 @@ class IntentRecognizer:
 - 用户意图基本明确但细节不完整（如"推荐手机"未说预算）→ 0.5-0.8
 - 用户意图模糊 → confidence < 0.5
 
+**五、执行策略信号**（所有意图类型均需准确填写）:
+
+- is_plannable: 执行步骤能否在开始前完整列出？
+  - true: 步骤明确，可以提前写出完整计划（如"查用户→搜商品→下单"、"搜索三个类目然后对比"）
+  - false: 需要边做边看，结果不确定（如"帮我找最适合我的手机"、"探索一下有没有合适的方案"）
+
 返回JSON格式:
-{{"intent_type": "...", "complexity": "simple/medium/complex", "confidence": 0.0-1.0, "requires_rag": true/false, "requires_mcp": true/false, "reason": "判断原因", "goal": "用户核心目标（一句话）", "constraints": ["明确约束1", "明确约束2"], "tool_name": "工具名或null（仅intent_type=mcp_execute时填写，必须与可用工具列表完全匹配）"}}
+{{"intent_type": "...", "complexity": "simple/medium/complex", "confidence": 0.0-1.0, "requires_rag": true/false, "requires_mcp": true/false, "reason": "判断原因", "goal": "用户核心目标（一句话）", "constraints": ["明确约束1", "明确约束2"], "tool_name": "工具名或null（仅intent_type=mcp_execute时填写，必须与可用工具列表完全匹配）", "is_plannable": true/false}}
 
 只返回JSON，不要其他说明。"""
 
         try:
-            response = self.llm_client.generate(prompt=prompt, temperature=0.1)
+            response = self.llm_client.generate(prompt=prompt, temperature=0.1, task_type="intent_classification")
             response = self._clean_json_response(response)
             result = json.loads(response)
 
@@ -237,6 +260,9 @@ class IntentRecognizer:
             # 新增：缓存 goal 和 constraints 到 intent_result（供 GoalUnderstanding 直接使用）
             goal = result.get('goal', '')
             constraints = result.get('constraints', [])
+
+            # 执行策略信号
+            is_plannable = bool(result.get('is_plannable', True))
 
             # 映射意图类型和复杂度
             intent_type = self._map_intent_type(intent_type_str)
@@ -260,6 +286,7 @@ class IntentRecognizer:
                 reason=reason,
                 requires_rag=requires_rag,
                 requires_mcp=requires_mcp,
+                is_plannable=is_plannable,
             )
             # 将 goal 和 constraints 附加到 result_obj，供 GoalUnderstanding 使用
             result_obj._goal = goal

@@ -40,9 +40,8 @@ class RateLimiter:
             global_max_per_minute: 30     # 全局每分钟最大调用次数
             per_tool_max_per_minute: 10   # 单工具每分钟最大调用次数
             per_session_max_total: 200    # 单会话最大总调用次数
-            tool_overrides:               # 特定工具的自定义限额
-              delete_order: 3             # 删除订单每分钟最多3次
-              create_order: 5
+            tool_overrides:               # 特定工具的自定义限额（工具名须与 MCP 实际名称一致）
+              create_complex_order: 5     # 下单每分钟最多5次
     """
 
     def __init__(self, config: Dict[str, Any] = None, logger: logging.Logger = None):

@@ -43,6 +43,7 @@ class SubTaskStatus(str, Enum):
     FAILED = "failed"           # 执行失败
     RETRYING = "retrying"       # 重试中
     CANCELLED = "cancelled"     # 已取消（依赖的子任务失败导致）
+    PAUSED = "paused"           # 暂停等待用户输入
 
 
 class DelegationReason(str, Enum):
@@ -153,10 +154,15 @@ class SubTask:
         self.status = SubTaskStatus.CANCELLED
         self.completed_at = time.time()
 
+    def mark_paused(self):
+        """等待用户输入（执行中途 NEED_INPUT）"""
+        self.status = SubTaskStatus.PAUSED
+
     @property
     def is_terminal(self) -> bool:
         return self.status in (
-            SubTaskStatus.COMPLETED, SubTaskStatus.FAILED, SubTaskStatus.CANCELLED
+            SubTaskStatus.COMPLETED, SubTaskStatus.FAILED,
+            SubTaskStatus.CANCELLED, SubTaskStatus.PAUSED,
         )
 
     @property
@@ -239,6 +245,10 @@ class TaskState:
 
     # ---- Phase 5 产出：交付 ----
     final_response: str = ""
+
+    # ---- 暂停等待用户输入的子任务 ----
+    # key = sub_task_id，value = 需要问用户的问题
+    paused_subtasks: Dict[str, str] = field(default_factory=dict)
 
     # ---- 元数据 ----
     created_at: float = field(default_factory=time.time)
@@ -337,6 +347,7 @@ class TaskState:
             "current_layer": self.current_layer,
             "integrated_result": self.integrated_result,
             "final_response": self.final_response,
+            "paused_subtasks": self.paused_subtasks,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }

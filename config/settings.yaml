@@ -24,10 +24,22 @@ llm:
   max_tokens: 5000
   timeout: 120
 
+  # 多模型路由：不同任务类型可使用不同模型（留空则使用默认 model）
+  # task_type 由各调用点传入 generate(task_type="xxx")
+  routing:
+    intent_classification: ""    # 意图分类（轻量任务，可用小模型）
+    parameter_check: ""          # 参数完整性校验（轻量，可用小模型）
+    rag_query: ""                # RAG 查询回答
+    planning: ""                 # 任务规划（复杂推理，建议大模型）
+    response_generation: ""      # 最终回复生成
+    # 示例（取消注释以启用差异化路由）：
+    # intent_classification: "qwen2.5:3b"
+    # planning: "qwen2.5:14b"
+
 # 向量数据库配置 (Chroma)
 vectordb:
   type: "chroma"
-  persist_directory: "../data/product_chroma_db"
+  persist_directory: "/Users/weyang3/PycharmProjects/smartShopping/data/product_chroma_db"
   collection_name: "knowledge_base"
 
 # 嵌入模型配置 (支持 local、ollama、openai)
@@ -72,10 +84,22 @@ intent:
     medium_step_threshold: 4   # 中等复杂度阈值：单意图4-7步 / ≤3意图4-7步
     complex_step_threshold: 7  # 复杂任务阈值：超过7步或多阶段流程
 
+# 自定义意图类型（插件式扩展，无需修改代码）
+# routing 指定此意图走哪条执行路径（mcp_execute / rag_simple / rag_advanced / simple_chat）
+custom_intents: []
+# 示例：
+# custom_intents:
+#   - name: "price_alert"
+#     description: "用户想要设置某商品价格降至目标价时收到通知"
+#     routing: "mcp_execute"
+#   - name: "wishlist"
+#     description: "用户想将商品加入心愿单"
+#     routing: "mcp_execute"
+
 # 任务评估配置
 evaluator:
   pre_evaluation: false       # 执行前评估
-  mid_evaluation: true       # 执行中评估（每步骤后）
+  mid_evaluation: false       # 执行中评估（每步骤后）
   post_evaluation: false      # 执行后评估
 
 # 任务规划配置
@@ -92,17 +116,17 @@ react:
 rag:
   # 查询重写
   query_rewrite:
-    enabled: true
+    enabled: false
     max_rewrites: 3
   
   # 多查询生成
   multi_query:
-    enabled: true
+    enabled: false
     num_queries: 3
   
   # HyDE (Hypothetical Document Embeddings)
   hyde:
-    enabled: true
+    enabled: false
   
   # 混合检索 (向量+BM25)
   hybrid_search:
@@ -275,6 +299,10 @@ security:
       添加: "inform"
       create: "inform"
       查询: "inform"
+  # 下单类工具集合（ToolCaller 将对这些工具自动注入幂等 key）
+  # 对应 MCP 服务中的实际工具名（见 mcp_manager_module/test_server_sse.py）
+  order_creation_tools:
+    - create_complex_order
   permissions:
     enabled: true
     default_role: "user"
@@ -283,8 +311,7 @@ security:
       global_max_per_minute: 30       # 全局每分钟最大调用次数
       per_tool_max_per_minute: 10     # 单工具每分钟最大调用次数
       per_session_max_total: 200      # 单会话最大总调用次数
-      tool_overrides:                 # 特定工具的自定义限额（每分钟）
-        delete_order: 3
+      tool_overrides:                 # 特定工具的自定义限额（每分钟，工具名须与 MCP 实际名称一致）
         create_complex_order: 5
 
 # 执行层配置

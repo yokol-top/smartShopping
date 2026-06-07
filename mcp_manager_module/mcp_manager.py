@@ -42,6 +42,9 @@ class MCPManager:
         self._server_tools_cache = {}  # 缓存从MCP服务器获取的工具列表
         self._server_info_cache = {}  # 缓存从MCP服务器获取的服务器信息
         self._tool_cat_cache: Dict[str, List[str]] = {}  # 工具名 → 类别列表
+        self._schema_cache: dict = {}   # key: tool_name, value: inputSchema dict（空dict=无schema）
+        self._tool_category_keywords: dict = {}  # 从 mcp_servers.yaml 加载的分类关键词
+        self._tool_description_hints: dict = {}  # 追加到工具 description 的额外提示
 
         self._load_config()
         
@@ -59,7 +62,9 @@ class MCPManager:
             
             self.servers = config.get('servers', [])
             self.enabled_servers = [s for s in self.servers if s.get('enabled', False)]
-            
+            self._tool_category_keywords = config.get('tool_categories', {})
+            self._tool_description_hints = config.get('tool_description_hints', {})
+
             self.logger.info(f"加载 {len(self.servers)} 个MCP服务配置，其中 {len(self.enabled_servers)} 个已启用")
             
             for server in self.enabled_servers:
@@ -204,10 +209,16 @@ class MCPManager:
             
             # 构建工具信息
             for tool in tool_details:
+                tool_name = tool['name']
+                description = tool.get('description', '')
+                # 追加 yaml 中配置的额外提示（如有效类目枚举等）
+                hint = self._tool_description_hints.get(tool_name, '').strip()
+                if hint:
+                    description = f"{description}\n{hint}" if description else hint
                 tools.append({
-                    'name': tool['name'],
+                    'name': tool_name,
                     'server': server_name,
-                    'description': tool.get('description', ''),
+                    'description': description,
                     'inputSchema': tool.get('inputSchema', {})
                 })
         
@@ -243,9 +254,20 @@ class MCPManager:
     }
 
     def _classify_tool(self, tool: Dict[str, Any]) -> List[str]:
-        """根据工具名称和描述关键词将工具归入一个或多个类别"""
+        """将工具分类（search / order / user / other），支持配置化关键词"""
         name = tool.get('name', '').lower()
         desc = tool.get('description', '').lower()
+        combined = f"{name} {desc}"
+
+        # 优先使用配置化关键词（来自 mcp_servers.yaml 的 tool_categories）
+        if self._tool_category_keywords:
+            categories = []
+            for category, keywords in self._tool_category_keywords.items():
+                if any(kw.lower() in combined for kw in keywords):
+                    categories.append(category)
+            return categories or ['other']
+
+        # 降级：原有基于 _TOOL_CATEGORY_RULES 的逻辑（向后兼容）
         categories = []
         for cat, rules in self._TOOL_CATEGORY_RULES.items():
             if any(k in name for k in rules['name']) or any(k in desc for k in rules['desc']):
@@ -338,6 +360,28 @@ class MCPManager:
             f"total={len(all_tools)} → filtered={len(filtered)}"
         )
         return filtered
+
+    def get_tool_schema_cached(self, tool_name: str) -> dict:
+        """获取工具的 inputSchema，结果缓存（进程生命周期内有效）。
+        返回空 dict 表示工具不存在或无 schema。
+        """
+        if tool_name not in self._schema_cache:
+            tools = self.get_available_tools(use_cache=True)
+            for t in tools:
+                if t.get('name') == tool_name:
+                    self._schema_cache[tool_name] = t.get('inputSchema') or {}
+                    break
+            else:
+                self._schema_cache[tool_name] = {}   # 工具不存在，缓存空dict
+        return self._schema_cache[tool_name]
+
+    def has_required_params(self, tool_name: str) -> bool:
+        """工具是否存在必需参数（required 字段非空）。
+        用于 GoalUnderstanding 的快路径：无必需参数时跳过 LLM 校验。
+        """
+        schema = self.get_tool_schema_cached(tool_name)
+        required = schema.get('required', [])
+        return bool(required)
 
     async def _call_tool_sse(
         self,

@@ -10,7 +10,9 @@
 基于原有的 IntentRecognizer 扩展，保持向后兼容。
 """
 import json
+import re
 import logging
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Dict, Any, Optional, List
 
@@ -25,14 +27,14 @@ class GoalUnderstandingResult:
     intent_result: IntentResult
 
     # 目标理解增强字段
-    user_goal: str = ""                              # 用户目标描述
+    user_goal: str = ""  # 用户目标描述
     constraints: List[str] = field(default_factory=list)  # 约束条件
     success_criteria: List[str] = field(default_factory=list)  # 成功标准
-    needs_clarification: bool = False                # 是否需要用户澄清
-    clarification_question: str = ""                 # 澄清问题
-    confidence: float = 0.0                          # 综合置信度 [0, 1]
-    reasoning: str = ""                              # 推理过程
-    memory_context_used: bool = False                # 是否使用了长期记忆
+    needs_clarification: bool = False  # 是否需要用户澄清
+    clarification_question: str = ""  # 澄清问题
+    confidence: float = 0.0  # 综合置信度 [0, 1]
+    reasoning: str = ""  # 推理过程
+    memory_context_used: bool = False  # 是否使用了长期记忆
 
     @property
     def intent_type(self) -> IntentType:
@@ -62,12 +64,12 @@ class GoalUnderstanding:
     CLARIFICATION_THRESHOLD = 0.6
 
     def __init__(
-        self,
-        config: Dict[str, Any],
-        llm_client,
-        intent_recognizer: IntentRecognizer,
-        long_term_memory=None,
-        logger: logging.Logger = None,
+            self,
+            config: Dict[str, Any],
+            llm_client,
+            intent_recognizer: IntentRecognizer,
+            long_term_memory=None,
+            logger: logging.Logger = None,
     ):
         self.config = config
         self.llm_client = llm_client
@@ -76,20 +78,17 @@ class GoalUnderstanding:
         self.logger = logger or logging.getLogger(__name__)
 
         goal_config = config.get('goal_understanding', {})
-        self.clarification_threshold = goal_config.get(
-            'clarification_threshold', self.CLARIFICATION_THRESHOLD
-        )
+        self.clarification_threshold = goal_config.get('clarification_threshold', self.CLARIFICATION_THRESHOLD)
         self.use_memory_reasoning = goal_config.get('use_memory_reasoning', True)
 
-        self.logger.info(
-            f"GoalUnderstanding 初始化完成 | 澄清阈值: {self.clarification_threshold}"
-        )
+        self.logger.info(f"GoalUnderstanding 初始化完成 | 澄清阈值: {self.clarification_threshold}")
 
     def understand(
-        self,
-        user_input: str,
-        conversation_context: str = "",
-        orchestrator_context: str = "",
+            self,
+            user_input: str,
+            conversation_context: str = "",
+            orchestrator_context: str = "",
+            long_term_context: str = "",
     ) -> GoalUnderstandingResult:
         """
         理解用户目标（主入口）
@@ -109,13 +108,13 @@ class GoalUnderstanding:
             GoalUnderstandingResult
         """
         tracer = get_tracer()
-        with tracer.start_span("goal.understand", {
-            "input.length": len(user_input),
-        }) if tracer else _noop():
+        # D3 fix: 用标准库 nullcontext 替代自定义 _noop
+        span_ctx = tracer.start_span("goal.understand", {"input.length": len(user_input)}) if tracer else nullcontext()
+        with span_ctx:
 
             # 记录输入上下文状态（便于排查上下文传递问题）
             self.logger.info(
-                f"[目标理解] === 开始 === | user_input: {user_input[:80]} | "
+                f"[目标理解] === 开始 === | user_input: {user_input} | "
                 f"conv_ctx_len: {len(conversation_context)} | "
                 f"orch_ctx_len: {len(orchestrator_context) if orchestrator_context else 0}"
             )
@@ -125,20 +124,26 @@ class GoalUnderstanding:
             )
             if orchestrator_context:
                 self.logger.debug(
-                    f"[目标理解] orchestrator上下文(last300): "
-                    f"{orchestrator_context[-300:]}"
+                    f"[目标理解] orchestrator上下文: "
+                    f"{orchestrator_context}"
                 )
 
             # Step 2: 预注入长期记忆（避免低置信度时的二次LLM调用）
             # 策略：在第一次 recognize 之前就查询记忆并注入上下文，
             # 这样无论置信度高低都只需要一次 LLM 调用。
+            # 优先使用外部传入的 long_term_context（ContextPipeline 已检索过），
+            # 未传入时才内部查询（降级兼容）。
             memory_context = ""
             memory_used = False
-            if self.use_memory_reasoning:
+            if long_term_context:
+                memory_context = long_term_context
+                memory_used = True
+                self.logger.info("[目标理解] 使用外部传入的长期记忆（无需内部查询）")
+            elif self.use_memory_reasoning:
                 memory_context = self._retrieve_memory_context(user_input)
                 if memory_context:
                     memory_used = True
-                    self.logger.info("[目标理解] 预注入长期记忆辅助推理（单次LLM调用）")
+                    self.logger.info("[目标理解] 内部查询长期记忆（降级模式，建议外部传入）")
 
             # Step 1: 基础意图识别（预注入记忆上下文，单次LLM调用完成）
             enriched_context = conversation_context
@@ -266,11 +271,11 @@ class GoalUnderstanding:
             return ""
 
     def _check_parameter_completeness(
-        self,
-        user_input: str,
-        context: str,
-        intent_result: IntentResult,
-        orchestrator_context: str = "",
+            self,
+            user_input: str,
+            context: str,
+            intent_result: IntentResult,
+            orchestrator_context: str = "",
     ) -> Dict[str, Any]:
         """
         检查用户输入是否包含了执行目标工具所需的关键参数
@@ -283,6 +288,17 @@ class GoalUnderstanding:
         Returns:
             {'is_complete': bool, 'missing': [str], 'reason': str}
         """
+        # 快路径：工具无必需参数，直接通过，跳过 LLM 调用
+        if self.intent_recognizer.mcp_manager:
+            try:
+                if not self.intent_recognizer.mcp_manager.has_required_params(intent_result.tool_name):
+                    self.logger.debug(
+                        f"[目标理解] 工具 {intent_result.tool_name} 无必需参数，跳过参数校验"
+                    )
+                    return {'is_complete': True, 'missing': [], 'reason': '工具无必需参数，直接通过'}
+            except Exception:
+                pass  # 检查失败时降级走原有逻辑
+
         # 获取工具的 inputSchema，递归展开嵌套对象
         tool_schema = self._get_tool_schema(intent_result.tool_name)
         schema_text = ""
@@ -293,10 +309,9 @@ class GoalUnderstanding:
         # 构建已知信息段：先提取关键 ID，再附上上下文原文（防止截断丢失关键实体）
         known_info_section = ""
         if orchestrator_context:
-            import re as _re
             # 优先提取最后出现的 CARD-xxx / ADDR-xxx，显式列出避免被截断遮蔽
-            card_ids = _re.findall(r'CARD-\d+', orchestrator_context)
-            addr_ids = _re.findall(r'ADDR-\d+', orchestrator_context)
+            card_ids = re.findall(r'CARD-\d+', orchestrator_context)
+            addr_ids = re.findall(r'ADDR-\d+', orchestrator_context)
             key_entity_lines = []
             if card_ids:
                 key_entity_lines.append(f"  - 银行卡ID(card_id): {card_ids[-1]}")
@@ -325,7 +340,7 @@ Orchestrator已知信息（包含之前子Agent的结果、用户已提供的实
 请严格按照上述"工具参数说明"中列出的参数来判断，用户是否提供了足够的信息。
 判断规则：
 1. 只检查工具参数说明中列出的参数，不要凭常识添加额外要求
-2. 对话上下文和Orchestrator中已有的信息（如用户ID、之前提到的数据）和实体（商品、地址、ID、银行卡、方案等）也算作已提供
+2. 对话上下文和Orchestrator中已有的信息（如用户ID、之前提到的数据）和实体（商品、地址或ID、ID、银行卡或ID、方案等）也算作已提供
 3. 用户说"用当前信息"、"用我的信息"、"系统中有我的信息"等表示使用已有数据，不需要再次提供
 4. 可选参数（非必需）即使没提供也算完整
 5. 如果工具参数是嵌套对象，只要用户提供了对象中的关键字段即可
@@ -337,7 +352,7 @@ Orchestrator已知信息（包含之前子Agent的结果、用户已提供的实
 只返回JSON。"""
 
         try:
-            response = self.llm_client.generate(prompt=prompt, temperature=0.1)
+            response = self.llm_client.generate(prompt=prompt, temperature=0.1, task_type="parameter_check")
             response = self._clean_json(response)
             result = json.loads(response)
             return {
@@ -353,7 +368,6 @@ Orchestrator已知信息（包含之前子Agent的结果、用户已提供的实
     @staticmethod
     def _clean_json(resp: str) -> str:
         """从LLM响应中提取第一个完整的JSON对象"""
-        import re
         resp = resp.strip()
         # 提取 ```json ... ``` 中的内容
         code_block = re.search(r'```(?:json)?\s*\n?(.*?)\n?```', resp, re.DOTALL)
@@ -387,24 +401,21 @@ Orchestrator已知信息（包含之前子Agent的结果、用户已提供的实
         return resp
 
     def _get_tool_schema(self, tool_name: str) -> Optional[Dict[str, Any]]:
-        """获取工具的 inputSchema"""
+        """获取工具的 inputSchema（走 MCPManager 缓存）"""
         if not self.intent_recognizer.mcp_manager:
             return None
         try:
-            tools = self.intent_recognizer.mcp_manager.get_available_tools(use_cache=True)
-            for tool in tools:
-                if tool.get('name') == tool_name:
-                    return tool.get('inputSchema', {})
+            schema = self.intent_recognizer.mcp_manager.get_tool_schema_cached(tool_name)
+            return schema if schema else None
         except Exception:
-            pass
-        return None
+            return None
 
     def _flatten_schema(
-        self,
-        schema: Dict[str, Any],
-        prefix: str = "",
-        depth: int = 0,
-        max_depth: int = 3,
+            self,
+            schema: Dict[str, Any],
+            prefix: str = "",
+            depth: int = 0,
+            max_depth: int = 3,
     ) -> list:
         """
         递归展开 JSON Schema，将嵌套对象的字段平铺为可读的参数列表。
@@ -438,7 +449,8 @@ Orchestrator已知信息（包含之前子Agent的结果、用户已提供的实
                     'required': resolved.get('required', []),
                     '$defs': defs,
                 }
-                lines.extend(self._flatten_schema(sub_schema, prefix=f"{full_name}.", depth=depth + 1, max_depth=max_depth))
+                lines.extend(
+                    self._flatten_schema(sub_schema, prefix=f"{full_name}.", depth=depth + 1, max_depth=max_depth))
             else:
                 # 叶子字段
                 type_info = resolved.get('type', '')
@@ -478,10 +490,10 @@ Orchestrator已知信息（包含之前子Agent的结果、用户已提供的实
         return info
 
     def _generate_clarification(
-        self,
-        user_input: str,
-        context: str,
-        intent_result: IntentResult,
+            self,
+            user_input: str,
+            context: str,
+            intent_result: IntentResult,
     ) -> str:
         """生成澄清问题"""
         # 如果有工具信息，生成更有针对性的澄清（递归展开嵌套参数）
@@ -554,7 +566,6 @@ Orchestrator已知信息（包含之前子Agent的结果、用户已提供的实
             success_criteria.append("回复内容准确、友好")
 
         # 从用户输入中提取显式约束（预算、时间等）
-        import re
         budget_match = re.search(r'预算[在是为]?(\d+[万w]?)', user_input)
         if budget_match:
             constraints.append(f"预算限制: {budget_match.group(1)}")
@@ -565,9 +576,3 @@ Orchestrator已知信息（包含之前子Agent的结果、用户已提供的实
             "success_criteria": success_criteria,
             "reasoning": f"基于意图类型({intent_type.value})规则派生",
         }
-
-
-class _noop:
-    """空上下文管理器"""
-    def __enter__(self): return self
-    def __exit__(self, *a): pass

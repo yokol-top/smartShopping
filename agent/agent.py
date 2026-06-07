@@ -3,7 +3,7 @@ import uuid
 from typing import Dict, Any, List  # noqa: F401 - used in type hints
 
 from context import ContextWindowManager
-from evaluation import AgentEvaluator
+from evaluation import AgentEvaluator, RAGEvaluator, EvalStore
 from input_gate import InputValidator
 from mcp_manager_module import MCPManager
 from memory import ShortTermMemory, LongTermMemory
@@ -82,6 +82,9 @@ class SmartAgent:
 
         # 初始化LLM客户端（传入全局系统提示词）
         self.logger.info("初始化LLM客户端...")
+        llm_routing = self.config.get('llm', {}).get('routing', {})
+        # 过滤掉空值（未配置的 task_type）
+        llm_routing = {k: v for k, v in llm_routing.items() if v}
         self.llm_client = LLMClient(
             api_key=self.config.get('llm', {}).get('api_key', 'EMPTY'),
             base_url=self.config.get('llm', {}).get('base_url', 'http://localhost:11434/v1'),
@@ -89,6 +92,7 @@ class SmartAgent:
             temperature=self.config.get('llm', {}).get('temperature', 0.7),
             max_tokens=self.config.get('llm', {}).get('max_tokens', 2000),
             system_prompt=system_prompt_content,
+            routing=llm_routing,
             logger=self.logger
         )
 
@@ -275,6 +279,10 @@ class SmartAgent:
             config=self.config,
             logger=self.logger,
         )
+        # 注入 factory：TaskPlanner 的分层规划并行执行依赖 SubAgentFactory，
+        # 但两者存在循环依赖（factory→task_planner→factory），所以在这里做延迟注入。
+        if hasattr(self.orchestrator, 'factory'):
+            self.task_planner.factory = self.orchestrator.factory
 
         # 商品知识库（RAG依赖）
         sub_agent_config = self.config.get('sub_agents', {})
@@ -290,16 +298,45 @@ class SmartAgent:
         self.logger.info("初始化评估层...")
         self.agent_evaluator = AgentEvaluator(self.config, logger=self.logger)
 
-        # 对话计数器（用于长期记忆总结）
+        # RAG 质量评估器
+        self.rag_evaluator = RAGEvaluator(self.config, llm_client=self.llm_client, logger=self.logger)
+
+        # 评估结果持久化存储
+        eval_db_path = self.config.get('evaluation', {}).get('db_path', './data/eval_store.db')
+        self.eval_store = EvalStore(db_path=eval_db_path, logger=self.logger)
+
+        # 对话计数器（用于长期记忆总结）—— 保留供外部读取和 reset_session 使用
         self.conversation_count = 0
         self.summary_threshold = self.config.get('memory', {}).get('long_term', {}).get('summary_threshold', 5)
 
-        # 响应摘要配置
-        response_summary_config = self.config.get('memory', {}).get('short_term', {}).get('response_summary', {})
-        self.response_summary_enabled = response_summary_config.get('enabled', True)
-        self.response_max_length = response_summary_config.get('max_length', 300)
-        self.logger.info(
-            f"响应摘要功能: {'启用' if self.response_summary_enabled else '禁用'}, 最大长度阈值: {self.response_max_length}")
+        # D1 fix: 响应摘要配置由 PostResponsePipeline 从 config 直接读取，此处无需重复存储
+
+        # 上下文装配流水线
+        from .context_pipeline import ContextPipeline
+        self.context_pipeline = ContextPipeline(
+            short_term_memory=self.short_term_memory,
+            long_term_memory=self.long_term_memory,
+            orchestrator=self.orchestrator,
+            config=self.config,
+            user_id=self.user_id,
+            username=self.username,
+            session_id=self.session_id,
+            degraded_components=self._degraded_components,
+            logger=self.logger,
+        )
+
+        # 响应后处理流水线
+        from .post_response_pipeline import PostResponsePipeline
+        self.post_pipeline = PostResponsePipeline(
+            short_term_memory=self.short_term_memory,
+            long_term_memory=self.long_term_memory,
+            session_manager=self.session_manager,
+            llm_client=self.llm_client,
+            agent_evaluator=self.agent_evaluator,
+            config=self.config,
+            degraded_components=self._degraded_components,
+            logger=self.logger,
+        )
 
         if self._degraded_components:
             self.logger.warning(
@@ -314,7 +351,7 @@ class SmartAgent:
         与用户进行对话
 
         完整流程：
-        输入验证 → 记忆上下文 → 目标理解（含澄清） → 任务规划与执行 → 输出审查 → 记忆更新 → Agent评估
+        输入验证 → 记忆上下文 → 目标理解（含澄清） → 任务规划与执行 → 输出审查 → 后处理流水线 → Agent评估
 
         Args:
             user_input: 用户输入
@@ -323,10 +360,6 @@ class SmartAgent:
         Returns:
             Agent的回复
         """
-        # ========== 快捷命令拦截（在所有流程之前，直接返回）==========
-        _cmd = user_input.strip().lower()
-        if _cmd in ('/clear_memory', '/清空记忆'):
-            return self.clear_long_term_memory()
 
         tracer = get_tracer()
         task_id = str(uuid.uuid4())[:8]
@@ -361,72 +394,42 @@ class SmartAgent:
             if self.user_id:
                 self.session_manager.add_message(self.session_id, 'user', user_input)
 
-            # 检查是否需要触发滚动总结
+            # 检查是否需要触发滚动总结（在 ContextPipeline 之前执行）
             if self.short_term_memory.should_trigger_summary():
                 self._generate_short_term_summary(verbose)
 
-            # 检查是否需要压缩历史摘要
+            # 检查是否需要压缩历史摘要（在 ContextPipeline 之前执行）
             if self.short_term_memory.needs_compression():
                 self._compress_historical_summary()
 
-            # 获取上下文（包含历史摘要）- 增加上下文窗口
+            # ========== 1. 上下文装配（仅一次） ==========
             with tracer.start_span("memory.retrieve_context"):
-                context = self.short_term_memory.get_context_string(last_n=8)
-
-                # 注入当前登录用户信息，让LLM在调用工具时使用正确的用户标识
-                if self.user_id:
-                    user_ctx = f"[当前登录用户] user_id={self.user_id}"
-                    if self.username:
-                        user_ctx += f", username={self.username}"
-                    context = user_ctx + "\n" + context
-
-                # Orchestrator enriche：解析用户对子Agent结果的引用（如"方案一"→具体商品）
-                sub_agent_enabled = self.config.get('sub_agents', {}).get('enabled', True)
-                if sub_agent_enabled and hasattr(self, 'orchestrator'):
-                    context = self.orchestrator.enrich_context(user_input, context)
-
-                self.logger.info(f"从短期记忆中获取到的上下文：{context}")
-
-                # 检索相关的长期记忆（语义搜索历史对话）
-                relevant_long_term = ""
-                if self.long_term_memory and 'long_term_memory' not in self._degraded_components:
-                    relevant_long_term = self._retrieve_relevant_long_term_context(user_input, top_k=3)
-                if relevant_long_term:
-                    self.logger.info(f"检索到相关历史对话")
-
-                # 注入用户偏好（预算/兴趣/品牌等，来自增量偏好记忆）
-                if self.user_id and self.long_term_memory and 'long_term_memory' not in self._degraded_components:
-                    try:
-                        pref_ctx = self.long_term_memory.format_user_preferences(self.user_id)
-                        if pref_ctx:
-                            relevant_long_term = (pref_ctx + "\n\n" + relevant_long_term).strip()
-                            self.logger.info(f"已注入用户偏好上下文")
-                    except Exception as _e:
-                        self.logger.debug(f"加载用户偏好失败（不影响主流程）: {_e}")
-
+                bundle = self.context_pipeline.build(user_input)
                 tracer.set_span_attributes({
-                    "memory.context_length": len(context),
-                    "memory.has_long_term": bool(relevant_long_term),
+                    "memory.context_length": len(bundle.context),
+                    "memory.has_long_term": bool(bundle.long_term),
                 })
 
-            # ========== 1. 目标理解层（增强意图识别 + 澄清机制） ==========
+            # ========== 2. 目标理解层（增强意图识别 + 澄清机制） ==========
             # 获取orchestrator结构化记忆，供参数完整性检查使用
             orchestrator_ctx = ""
-            if sub_agent_enabled and hasattr(self, 'orchestrator'):
+            sub_agent_enabled = self.config.get('sub_agents', {}).get('enabled', True)
+            if sub_agent_enabled:
                 orchestrator_ctx = self.orchestrator.memory.get_context_for_sub_agent()
             self.logger.info(
-                f"[主Agent] 传入目标理解层 | user_input: {user_input[:80]} | "
-                f"context_len: {len(context)} | orch_ctx_len: {len(orchestrator_ctx)}"
+                f"[主Agent] 传入目标理解层 | user_input: {user_input} | "
+                f"context_len: {len(bundle.context)} | orch_ctx_len: {len(orchestrator_ctx)}"
             )
             self.logger.debug(
-                f"[主Agent] context(last400): {context[-400:] if context else '(空)'}"
+                f"[主Agent] context: {bundle.context if bundle.context else '(空)'}"
             )
             if orchestrator_ctx:
-                self.logger.debug(
-                    f"[主Agent] orchestrator_ctx: {orchestrator_ctx[:300]}"
-                )
+                self.logger.debug(f"[主Agent] orchestrator_ctx: {orchestrator_ctx}")
             goal_result = self.goal_understanding.understand(
-                user_input, context, orchestrator_context=orchestrator_ctx
+                user_input,
+                bundle.context,
+                orchestrator_context=orchestrator_ctx,
+                long_term_context=bundle.long_term,
             )
             intent_result = goal_result.intent_result
             self.logger.info(
@@ -451,9 +454,15 @@ class SmartAgent:
                 clarification = goal_result.clarification_question
                 self.short_term_memory.add_message("assistant", clarification)
                 self.short_term_memory.increment_message_count()
+                # B4 fix: 澄清回复也需要持久化到会话存储，否则会话恢复后上下文断裂
+                if self.user_id:
+                    self.session_manager.add_message(self.session_id, 'assistant', clarification)
                 if verbose:
                     print(f"❓ 需要澄清\n")
                 return clarification
+
+            # 取 token 快照（在任务开始前）
+            usage_snapshot = self.llm_client.get_usage_snapshot()
 
             # 记录任务开始（Agent评估）
             self.agent_evaluator.task_started(
@@ -463,7 +472,7 @@ class SmartAgent:
                 complexity=intent_result.complexity.value,
             )
 
-            # ========== 2. Orchestrator统一执行 ==========
+            # ========== 3. Orchestrator统一执行 ==========
             # 主Agent的三重身份：
             # a) 执行者 —— 简单任务自己通过TaskPlanner完成
             # b) 指挥官 —— 中等/复杂任务分解、动态创建子Agent委派、汇总
@@ -476,12 +485,38 @@ class SmartAgent:
             response = self.orchestrator.handle_request(
                 user_query=user_input,
                 intent_result=intent_result,
-                context=context,
-                long_term_context=relevant_long_term,
-                user_id=self.user_id or "",
-                username=self.username or "",
+                context=bundle.context,
+                long_term_context=bundle.long_term,
+                user_id=bundle.user_id,
+                username=bundle.username,
                 verbose=verbose,
             )
+
+            # 执行中途需要用户补充信息（与前置澄清走相同路径）
+            if isinstance(response, str) and response.startswith("__NEED_INPUT__:"):
+                question = response[len("__NEED_INPUT__:"):]
+                self.short_term_memory.add_message("assistant", question)
+                self.short_term_memory.increment_message_count()
+                if self.user_id:
+                    self.session_manager.add_message(self.session_id, 'assistant', question)
+                # B1 fix: task_started 已在前面调用，此处提前返回必须配套 task_completed，
+                # 否则 AgentEvaluator._active_tasks 会持续累积，造成内存泄漏
+                self.agent_evaluator.task_completed(
+                    task_id=task_id, success=False, error="执行中需要用户输入"
+                )
+                # M2 fix: 记录 need_input 触发事件，便于监控"执行中途需要补充信息"的频率
+                self.logger.info(
+                    f"[监控] need_input 触发 | task_id={task_id} | "
+                    f"intent={intent_result.intent_type.value} | "
+                    f"question_len={len(question)}"
+                )
+                tracer.set_span_attributes({
+                    "agent.need_input": True,
+                    "agent.intent_type": intent_result.intent_type.value,
+                })
+                if verbose:
+                    print(f"\u23f8 执行中需要用户补充信息\n")
+                return question
 
             # 持久化任务状态（支持会话恢复时重建）
             task_state = self.orchestrator.get_current_task_state()
@@ -493,7 +528,7 @@ class SmartAgent:
                 except Exception as e:
                     self.logger.debug(f"任务状态持久化失败（不影响主流程）: {e}")
 
-            # ========== 3. 输出层：安全审查 ==========
+            # ========== 4. 输出层：安全审查 ==========
             review_result = self.output_guard.review(response)
             if not review_result.is_safe:
                 self.logger.warning(f"输出审查警告: {review_result.warnings}")
@@ -502,147 +537,70 @@ class SmartAgent:
                 self.logger.info("输出已进行敏感信息脱敏")
                 response = review_result.cleaned_output
 
-            # 添加到短期记忆（智能摘要长响应，仅用于上下文窗口管理）
+            # ========== 5. 后处理流水线 ==========
             with tracer.start_span("memory.update"):
-                response_for_memory = self._prepare_response_for_memory(response, user_input, context)
-                self.short_term_memory.add_message("assistant", response_for_memory)
-                self.short_term_memory.increment_message_count()
+                is_failed = getattr(self.orchestrator, '_last_request_failed', False)
+                first_message = (self.post_pipeline.conversation_count == 0)
+                token_usage = self.llm_client.compute_usage_delta(usage_snapshot)
+                self.post_pipeline.run(
+                    task_id=task_id,
+                    user_input=user_input,
+                    response=response,
+                    bundle=bundle,
+                    is_failed=is_failed,
+                    first_message=first_message,
+                    token_usage=token_usage,
+                )
+                # 同步 agent 级别的对话计数器（供外部读取和 reset_session 使用）
+                self.conversation_count = self.post_pipeline.conversation_count
 
-                # 持久化 Agent 响应到会话存储（存原始完整回复，与用户看到的一致）
-                if self.user_id:
-                    self.session_manager.add_message(self.session_id, 'assistant', response)
-                    # 首条用户消息时自动生成会话标题
-                    if self.conversation_count == 0:
-                        self.session_manager.auto_generate_title(self.session_id, user_input)
+            response = self._strip_json_wrapper(response)
+            self.logger.info(f"Agent回复: {response[:100]}{'...' if len(response) > 100 else ''}")
 
-                # 更新对话计数
-                self.conversation_count += 1
-
-                # 检查是否需要生成长期记忆总结
-                if self.conversation_count % self.summary_threshold == 0:
-                    self._generate_long_term_summary()
-
-                # 增量提取并存储用户偏好（预算/兴趣/品牌等）
-                if self.user_id and self.long_term_memory and 'long_term_memory' not in self._degraded_components:
-                    self._update_user_preferences_from_turn(user_input, response)
-
-            # ========== 4. Agent评估：记录任务完成 ==========
-            exec_failed = getattr(self.orchestrator, '_last_request_failed', False)
-            self.agent_evaluator.task_completed(
-                task_id=task_id,
-                success=not exec_failed,
-                error="执行降级" if exec_failed else "",
-            )
-
-            self.logger.info(f"Agent回复: {response[:100]}...")
-
-            tracer.set_span_attributes({
+            # M1 fix: 记录 token 消耗，便于成本监控
+            attrs = {
                 "agent.intent_type": intent_result.intent_type.value,
                 "agent.complexity": intent_result.complexity.value,
                 "agent.response_length": len(response),
                 "agent.goal_confidence": goal_result.confidence,
-            })
+            }
+            if token_usage:
+                attrs["agent.input_tokens"] = token_usage.get("input_tokens", 0)
+                attrs["agent.output_tokens"] = token_usage.get("output_tokens", 0)
+                attrs["agent.llm_calls"] = token_usage.get("llm_calls", 0)
+            tracer.set_span_attributes(attrs)
             tracer.set_span_ok()
 
             return response
 
-    def _retrieve_relevant_long_term_context(self, query: str, top_k: int = 3) -> str:
-        """检索相关的长期记忆上下文"""
-        try:
-            if not self.long_term_memory:
-                return ""
-            # 跨会话搜索用户的相关历史对话
-            similar_convs = self.long_term_memory.search_similar_conversations(
-                query=query,
-                user_id=self.user_id,
-                n_results=top_k
-            )
+    @staticmethod
+    def _strip_json_wrapper(text: str) -> str:
+        """剥离 LLM 误输出的 JSON 包裹壳，提取真实的用户可见内容。
 
-            if not similar_convs:
-                return ""
-
-            # 格式化为上下文字符串
-            context_parts = ["[相关历史对话记忆]"]
-            for i, conv in enumerate(similar_convs, 1):
-                context_parts.append(f"{i}. {conv['summary']}")
-
-            return "\n".join(context_parts)
-        except Exception as e:
-            self.logger.error(f"检索长期记忆失败: {e}")
-            return ""
-
-    def _prepare_response_for_memory(self, response: str, user_input: str, context: str) -> str:
+        处理两种常见问题格式：
+        1. Markdown 代码块包裹：```json\n{"reply": "实际内容"}\n```
+        2. 顶层 JSON 对象含 reply/answer/content 键：{"reply": "实际内容"}
         """
-        准备响应以存入短期记忆（长响应自动摘要）
-        
-        Args:
-            response: 完整的助手响应
-            user_input: 用户输入
-            context: 对话上下文
-            
-        Returns:
-            要存入短期记忆的响应（原文或摘要）
-        """
-        # 如果禁用响应摘要功能，直接返回原响应
-        if not self.response_summary_enabled:
-            return response
+        import json, re
+        s = text.strip()
 
-        # 如果响应长度在阈值内，直接返回
-        if len(response) <= self.response_max_length:
-            self.logger.debug(f"响应长度({len(response)})在阈值内，直接存储")
-            return response
+        # 1. 剥掉 ```json ... ``` 代码块
+        code_block = re.match(r'^```(?:json)?\s*\n?(.*?)\n?```\s*$', s, re.DOTALL)
+        if code_block:
+            s = code_block.group(1).strip()
 
-        # 响应过长，需要提取关键信息
-        self.logger.info(f"响应过长({len(response)}字符)，准备提取关键信息后存储")
+        # 2. 如果剩余内容是 JSON 对象，尝试提取回复键
+        if s.startswith("{"):
+            try:
+                obj = json.loads(s)
+                for key in ("reply", "answer", "content", "response", "message"):
+                    val = obj.get(key)
+                    if isinstance(val, str) and val.strip():
+                        return val.strip()
+            except (json.JSONDecodeError, Exception):
+                pass
 
-        try:
-            summary = self._summarize_response(response, user_input, context)
-            self.logger.info(f"响应摘要完成，原长度: {len(response)}, 摘要长度: {len(summary)}，原响应：{response}，摘要信息：{summary}")
-            return summary
-        except Exception as e:
-            self.logger.error(f"响应摘要失败: {e}，使用截断方式")
-            # 如果摘要失败，使用简单截断策略
-            return response[:self.response_max_length] + "...(已截断)"
-
-    def _summarize_response(self, response: str, user_input: str, context: str) -> str:
-        prompt = f"""你是一个信息提取助手。用户刚刚提出了一个问题，AI助手给出了一个详细的回答。现在需要从这个回答中提取核心信息，用于后续对话的上下文记忆。
-
-用户问题：
-{user_input}
-
-助手的完整回答：
-{response}
-
-请提取回答中的关键信息，要求：
-1. **【最重要】必须原样保留所有ID标识符**（如用户ID: UID-XXXX、商品ID: PXXX、订单号: ORD-XXXX、地址ID: ADDR-XXX、卡号ID: CARD-XXX等），这些是后续操作的关键依赖
-2. 保留直接回答用户问题的核心内容
-3. 保留重要的事实、数据、结论
-4. 保留用户可能在后续对话中引用的关键点（价格、名称、状态等）
-5. 去除示例代码、详细步骤、空行等冗长内容（只保留要点）
-6. 去除客套话和重复内容
-7. 控制在{self.response_max_length}字以内
-8. 保持信息的准确性和可理解性
-
-提取的关键信息："""
-        """
-        使用LLM提取响应中的关键信息
-        
-        Args:
-            response: 完整响应
-            user_input: 用户输入
-            context: 对话上下文
-            
-        Returns:
-            提取的关键信息摘要
-        """
-
-        summary = self.llm_client.generate(
-            prompt=prompt,
-            temperature=0.2,
-            max_tokens=int(self.response_max_length * 1.5)  # 留一些余量
-        ).strip()
-
-        return summary
+        return text  # 无需处理时原样返回
 
     def _compress_historical_summary(self):
         """
@@ -746,119 +704,6 @@ class SmartAgent:
 
         except Exception as e:
             self.logger.error(f"生成短期记忆摘要失败: {e}")
-
-    def _generate_long_term_summary(self):
-        """生成长期记忆总结"""
-        self.logger.info(f"生成长期记忆总结（对话轮次: {self.conversation_count}）")
-
-        try:
-            # 获取最近的对话
-            recent_messages = self.short_term_memory.get_messages()
-
-            if len(recent_messages) < 2:
-                return
-
-            # 构建总结prompt
-            conversation_text = "\n".join([
-                f"{msg['role']}: {msg['content']}"
-                for msg in recent_messages
-            ])
-
-            prompt = f"""请总结以下对话的主要内容：
-
-{conversation_text}
-
-请提供：
-1. 对话的主要主题
-2. 关键讨论点
-3. **【必须保留】所有出现的ID标识符**（用户ID、商品ID、订单号、地址ID等），这些在后续对话中会被引用
-
-总结："""
-
-            summary = self.llm_client.generate(
-                prompt=prompt,
-                temperature=0.3,
-                max_tokens=200
-            ).strip()
-
-            # 提取主题
-            topics = []  # 简化版，实际可以用NLP提取
-
-            # 保存到长期记忆
-            self.long_term_memory.add_conversation_summary(
-                session_id=self.session_id,
-                user_id=self.user_id or "",
-                summary=summary,
-                topics=topics
-            )
-
-            self.logger.info("长期记忆总结已保存")
-        except Exception as e:
-            self.logger.error(f"生成长期记忆总结失败: {e}")
-
-    def _update_user_preferences_from_turn(self, user_input: str, response: str) -> None:
-        """从当前对话轮次提取用户偏好并增量存储（后台线程，不阻塞主响应）。
-
-        只提取本轮明确提到的偏好信息，发生异常时静默失败。
-        """
-        user_id = self.user_id  # 捕获引用，避免闭包问题
-
-        def _task():
-            try:
-                prefs = self._extract_user_preferences(user_input, response)
-                if prefs:
-                    self.long_term_memory.update_user_preferences(user_id, prefs)
-                    self.logger.info(f"[后台] 用户偏好已更新: {list(prefs.keys())}")
-            except Exception as e:
-                self.logger.debug(f"[后台] 偏好更新失败（不影响主流程）: {e}")
-
-        t = threading.Thread(target=_task, daemon=True, name="pref-update")
-        t.start()
-
-    def _extract_user_preferences(self, user_input: str, response: str) -> dict:
-        """使用 LLM 从对话轮次中提取用户偏好信息。
-
-        只提取本轮明确出现的信息，未提及的字段不包含在返回中。
-
-        Returns:
-            偏好字典，可能为空 dict（无偏好信息时）
-        """
-        import json as _json
-        import re as _re
-
-        prompt = f"""从以下对话中提取用户的偏好信息（仅提取本轮明确提到的内容）。
-
-用户: {user_input}
-助手: {response[:400]}
-
-请以JSON格式返回，只包含本轮对话中**明确出现**的偏好字段：
-{{
-  "budget": "预算限制（如'2万以内'，未提到则不填此字段）",
-  "interests": "兴趣/偏好品类（如'电子产品'，未提到则不填此字段）",
-  "preferred_brands": "偏好品牌（未提到则不填此字段）",
-  "usage_scenario": "使用场景（如'办公'、'游戏'，未提到则不填此字段）"
-}}
-
-规则：
-- 没有明确提到的字段**不要**包含在JSON中
-- 如果本轮没有任何偏好信息，返回 {{}}
-- 只返回JSON，不要其他内容"""
-
-        try:
-            resp = self.llm_client.generate(prompt=prompt, temperature=0.1).strip()
-            code_block = _re.search(r'```(?:json)?\s*\n?(.*?)\n?```', resp, _re.DOTALL)
-            if code_block:
-                resp = code_block.group(1).strip()
-            brace_start = resp.find('{')
-            brace_end = resp.rfind('}')
-            if brace_start >= 0 and brace_end > brace_start:
-                resp = resp[brace_start:brace_end + 1]
-            prefs = _json.loads(resp)
-            # 过滤掉空值
-            return {k: v for k, v in prefs.items() if v and str(v).strip()}
-        except Exception as e:
-            self.logger.debug(f"偏好提取失败: {e}")
-            return {}
 
     def add_documents_to_knowledge_base(
             self,
@@ -1034,6 +879,12 @@ class SmartAgent:
         else:
             self.session_id = str(uuid.uuid4())
 
+        # 同步 context_pipeline.session_id，避免 bundle.session_id 过期
+        # 导致助手回复被写入旧 session（用户消息写新 session，数据割裂）
+        self.context_pipeline.session_id = self.session_id
+        # 重置 post_pipeline 计数器，确保新会话第一条消息能触发自动标题生成
+        self.post_pipeline.conversation_count = 0
+
         if self.long_term_memory:
             self.long_term_memory.create_session(self.session_id)
         self._is_resumed_session = False
@@ -1055,11 +906,19 @@ class SmartAgent:
             return False
 
         self.session_id = session_id
+        # 同步 context_pipeline.session_id，确保 bundle.session_id 与当前 session 一致
+        self.context_pipeline.session_id = self.session_id
         self._is_resumed_session = True
         self.short_term_memory.clear()
         if self.long_term_memory:
             self.long_term_memory.create_session(self.session_id)
         self._load_session_history()
+        # 恢复的会话已有历史消息，post_pipeline 计数器需设为正数，
+        # 避免 first_message=True 触发 auto_generate_title 覆盖原有标题
+        self.post_pipeline.conversation_count = max(
+            self.post_pipeline.conversation_count,
+            session_info.message_count // 2 if session_info.message_count else 1,
+        )
         self.logger.info(f"已恢复会话: {session_id[:8]}... | 标题: {session_info.title}")
         return True
 

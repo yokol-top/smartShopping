@@ -35,3 +35,32 @@ servers:
 # 1. 工具列表会自动从MCP服务器动态获取，无需在配置中手动列出
 # 2. 实际使用时需要根据你的MCP服务器进行配置
 # 3. 你可以添加更多的MCP服务器
+
+# 工具分类关键词（用于 MCPManager._classify_tool 的意图过滤）
+# 匹配规则：工具名称或描述中包含以下关键词时归入对应类别
+# 注意：避免使用过于通用的词（如 query/find），以免误匹配跨类别工具
+#
+# 当前实际 MCP 工具名（见 mcp_manager_module/test_server_sse.py）：
+#   search_products, get_user_detail, update_user_profile_refined,
+#   create_complex_order, query_order_detail, list_all_orders, create_user
+# 工具额外提示（追加到 MCP 服务器返回的 description 后面，用于向 LLM 补充关键约束）
+# 格式：tool_name: "追加内容"
+tool_description_hints:
+  search_products: |
+    可用类目（category 参数必须从以下选择，不得自造）：手机、笔记本电脑、平板电脑、智能手表、耳机。
+    keyword 应填商品关键词（品牌/型号/功能），不要和 category 填同一个值；若无特定关键词可填空。
+
+tool_categories:
+  search:
+    - search_products    # 精确匹配 search_products
+    - search             # 兜底：未来新增的搜索类工具
+  order:
+    - create_complex_order  # 精确匹配下单工具
+    - query_order_detail    # 精确匹配订单查询工具
+    - list_all_orders       # 精确匹配订单列表工具
+    - order                 # 兜底：名称含 order 的未来工具
+  user:
+    - get_user_detail           # 精确匹配用户详情工具
+    - update_user_profile       # 前缀匹配 update_user_profile_refined
+    - create_user               # 精确匹配创建用户工具
+    - user                      # 兜底：名称含 user 的未来工具

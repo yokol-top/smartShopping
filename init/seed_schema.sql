@@ -34,17 +34,19 @@ CREATE TABLE IF NOT EXISTS bank_cards (
 
 -- 订单表
 CREATE TABLE IF NOT EXISTS orders (
-    order_id   TEXT PRIMARY KEY,
-    user_id    TEXT NOT NULL,
-    product    TEXT NOT NULL,
-    quantity   INTEGER NOT NULL,
-    customer   TEXT NOT NULL,
-    address    TEXT NOT NULL,
-    card_end   TEXT NOT NULL,
-    status     TEXT NOT NULL DEFAULT '已下单',
-    created_at TEXT NOT NULL,
+    order_id        TEXT PRIMARY KEY,
+    user_id         TEXT NOT NULL,
+    product         TEXT NOT NULL,
+    quantity        INTEGER NOT NULL,
+    customer        TEXT NOT NULL,
+    address         TEXT NOT NULL,
+    card_end        TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT '已下单',
+    created_at      TEXT NOT NULL,
+    idempotency_key TEXT,
     FOREIGN KEY (user_id) REFERENCES users(user_id)
 );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_idempotency ON orders(idempotency_key) WHERE idempotency_key IS NOT NULL;
 
 -- 商品表
 CREATE TABLE IF NOT EXISTS products (

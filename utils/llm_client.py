@@ -1,4 +1,5 @@
 import logging
+import threading
 import time
 from contextlib import contextmanager
 from typing import List, Dict, Optional
@@ -29,6 +30,7 @@ class LLMClient:
         max_tokens: int = 2000,
         timeout: int = 120,
         system_prompt: Optional[str] = None,
+        routing: dict = None,
         logger: logging.Logger = None
     ):
         """
@@ -53,6 +55,13 @@ class LLMClient:
         self.max_tokens = max_tokens
         self.global_system_prompt = system_prompt
         self.logger = logger or logging.getLogger(__name__)
+        self._routing: dict = routing or {}
+
+        # Token 使用量累计（线程安全）
+        self._usage_lock = threading.Lock()
+        self._total_input_tokens: int = 0
+        self._total_output_tokens: int = 0
+        self._total_calls: int = 0
         
         self.logger.info(f"初始化LLM客户端")
         self.logger.info(f"  基础URL: {base_url}")
@@ -74,6 +83,7 @@ class LLMClient:
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
         stream: bool = False,
+        task_type: Optional[str] = None,
         **kwargs
     ) -> str:
         """
@@ -92,18 +102,16 @@ class LLMClient:
         temp = temperature if temperature is not None else self.temperature
         max_tok = max_tokens if max_tokens is not None else self.max_tokens
 
-        self.logger.debug(f"调用LLM - 消息数: {len(messages)}, 温度: {temp}")
-        if self.logger.isEnabledFor(logging.DEBUG):
-            for i, msg in enumerate(messages):
-                self.logger.debug(
-                    f"[LLM INPUT {i}] role={msg.get('role')} | "
-                    f"{msg.get('content', '')}"
-                )
+        # 按 task_type 路由模型（不修改 self.model，线程安全）
+        effective_model = self._routing.get(task_type) if task_type else None
+        effective_model = effective_model or self.model
+
+        self.logger.debug(f"调用LLM - 消息数: {len(messages)}, 温度: {temp}，输入：{messages[1].get('content', '')}")
 
         tracer = get_tracer()
         with (tracer.start_span("gen_ai.chat", {
             "gen_ai.system": "openai",
-            "gen_ai.request.model": self.model,
+            "gen_ai.request.model": effective_model,
             "gen_ai.request.temperature": temp,
             "gen_ai.request.max_tokens": max_tok,
         }) if tracer and tracer.enabled else _noop_context()):
@@ -113,7 +121,7 @@ class LLMClient:
                     result = self._chat_stream(messages, temp, max_tok, **kwargs)
                 else:
                     response = self.client.chat.completions.create(
-                        model=self.model,
+                        model=effective_model,
                         messages=messages,
                         temperature=temp,
                         max_tokens=max_tok,
@@ -121,16 +129,15 @@ class LLMClient:
                     )
 
                     result = response.choices[0].message.content
-                    self.logger.debug(f"LLM响应长度: {len(result)}")
-                    self.logger.debug(f"[LLM OUTPUT] {result}")
+                    self.logger.debug(f"LLM响应长度: {len(result)}，{result}")
 
                     # 记录 GenAI 标准属性
+                    usage = getattr(response, 'usage', None)
                     if tracer and tracer.enabled:
-                        usage = getattr(response, 'usage', None)
                         prompt_text = messages[-1].get('content', '') if messages else ''
                         finish_reason = response.choices[0].finish_reason if response.choices else None
                         tracer.record_llm_call(
-                            model=self.model,
+                            model=effective_model,
                             prompt=prompt_text,
                             response=result,
                             temperature=temp,
@@ -141,6 +148,13 @@ class LLMClient:
                             duration_ms=(time.time() - start_time) * 1000,
                         )
                         tracer.set_span_ok()
+
+                    # 累计 token 使用量
+                    with self._usage_lock:
+                        if usage:
+                            self._total_input_tokens += getattr(usage, 'prompt_tokens', 0) or 0
+                            self._total_output_tokens += getattr(usage, 'completion_tokens', 0) or 0
+                        self._total_calls += 1
 
                 return result
             except Exception as e:
@@ -186,6 +200,7 @@ class LLMClient:
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
         system_prompt: Optional[str] = None,
+        task_type: Optional[str] = None,
         **kwargs
     ) -> str:
         """
@@ -211,8 +226,8 @@ class LLMClient:
         
         messages.append({"role": "user", "content": prompt})
         
-        return self.chat(messages, temperature, max_tokens, **kwargs)
-    
+        return self.chat(messages, temperature, max_tokens, task_type=task_type, **kwargs)
+
     def chat_with_context(
         self,
         user_message: str,
@@ -281,6 +296,28 @@ class LLMClient:
         
         return results
     
+    def get_usage_snapshot(self) -> dict:
+        """获取当前 token 使用量快照（用于计算任务级增量）"""
+        with self._usage_lock:
+            return {
+                'input_tokens': self._total_input_tokens,
+                'output_tokens': self._total_output_tokens,
+                'calls': self._total_calls,
+            }
+
+    def compute_usage_delta(self, snapshot: dict) -> dict:
+        """计算自快照以来的 token 增量"""
+        current = self.get_usage_snapshot()
+        return {
+            'input_tokens': current['input_tokens'] - snapshot.get('input_tokens', 0),
+            'output_tokens': current['output_tokens'] - snapshot.get('output_tokens', 0),
+            'calls': current['calls'] - snapshot.get('calls', 0),
+        }
+
+    def get_total_usage(self) -> dict:
+        """获取全会话累计 token 使用量"""
+        return self.get_usage_snapshot()
+
     def update_config(
         self,
         model: Optional[str] = None,

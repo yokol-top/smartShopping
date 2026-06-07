@@ -247,11 +247,14 @@ def handle_command(command, agent, verbose):
     """
     parts = command.strip().split()
     cmd = parts[0].lower()
-    
+
     if cmd in ['/quit', '/exit']:
         print("\n👋 再见！感谢使用SmartAgent！\n")
         return False, verbose
-    
+
+    elif cmd in ['/clear_memory', '/清空记忆']:
+        agent.clear_long_term_memory()
+
     elif cmd == '/help':
         print_help()
     

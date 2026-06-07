@@ -31,6 +31,9 @@ class TaskRecord:
     error: str = ""
     rag_score: float = -1.0   # RAG评估分数，-1表示无RAG
     eval_passed: bool = True   # 任务评估是否通过
+    input_tokens: int = 0
+    output_tokens: int = 0
+    llm_calls: int = 0
 
 
 @dataclass
@@ -49,6 +52,10 @@ class AgentMetrics:
     complexity_distribution: Dict[str, int] = field(default_factory=dict)
     recent_errors: List[str] = field(default_factory=list)
     evaluation_timestamp: str = ""
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+    total_llm_calls: int = 0
+    avg_tokens_per_task: float = 0.0
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -65,6 +72,10 @@ class AgentMetrics:
             "complexity_distribution": self.complexity_distribution,
             "recent_errors": self.recent_errors[-5:],
             "evaluation_timestamp": self.evaluation_timestamp,
+            "total_input_tokens": self.total_input_tokens,
+            "total_output_tokens": self.total_output_tokens,
+            "total_llm_calls": self.total_llm_calls,
+            "avg_tokens_per_task": round(self.avg_tokens_per_task, 1),
         }
 
     def summary(self) -> str:
@@ -76,6 +87,7 @@ class AgentMetrics:
             f"  平均步骤: {self.avg_steps_per_task:.1f} | 平均耗时: {self.avg_response_time_ms:.0f}ms\n"
             f"  重规划率: {self.replan_rate:.1%} | 鲁棒性: {self.robustness_score:.2f}\n"
             f"  RAG平均质量: {self.avg_rag_score:.2f}\n"
+            f"  Token消耗: 输入 {self.total_input_tokens} / 输出 {self.total_output_tokens} / 调用 {self.total_llm_calls} 次\n"
         )
 
 
@@ -129,6 +141,7 @@ class AgentEvaluator:
         rag_score: float = -1.0,
         eval_passed: bool = True,
         error: str = "",
+        token_usage: Optional[dict] = None,
     ):
         """记录任务完成"""
         if not self.enabled:
@@ -145,6 +158,11 @@ class AgentEvaluator:
         record.rag_score = rag_score
         record.eval_passed = eval_passed
         record.error = error
+
+        if token_usage:
+            record.input_tokens = token_usage.get('input_tokens', 0)
+            record.output_tokens = token_usage.get('output_tokens', 0)
+            record.llm_calls = token_usage.get('calls', 0)
 
         self._records.append(record)
 
@@ -214,6 +232,12 @@ class AgentEvaluator:
         # 最近错误
         recent_errors = [r.error for r in records if r.error][-5:]
 
+        # Token 统计
+        total_input = sum(r.input_tokens for r in records)
+        total_output = sum(r.output_tokens for r in records)
+        total_calls = sum(r.llm_calls for r in records)
+        avg_tokens = (total_input + total_output) / total if total > 0 else 0
+
         return AgentMetrics(
             total_tasks=total,
             completed_tasks=completed,
@@ -228,6 +252,10 @@ class AgentEvaluator:
             complexity_distribution=dict(complexity_dist),
             recent_errors=recent_errors,
             evaluation_timestamp=datetime.now().isoformat(),
+            total_input_tokens=total_input,
+            total_output_tokens=total_output,
+            total_llm_calls=total_calls,
+            avg_tokens_per_task=avg_tokens,
         )
 
     def print_metrics(self, last_n: Optional[int] = None):

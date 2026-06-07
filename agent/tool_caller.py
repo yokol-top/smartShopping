@@ -8,9 +8,13 @@
 - 实际工具调用（MCP + 本地工具）
 """
 
+import hashlib
 import json
 import logging
+import threading
 from typing import Dict, Any, List, Optional
+
+from .circuit_breaker import CircuitBreaker
 
 
 class ToolCaller:
@@ -26,13 +30,40 @@ class ToolCaller:
         mcp_manager=None,
         tool_manager=None,
         context_manager=None,
+        config: dict = None,
         logger: logging.Logger = None,
     ):
         self.llm_client = llm_client
         self.mcp_manager = mcp_manager
         self.tool_manager = tool_manager
         self.context_manager = context_manager
+        self.config = config or {}
         self.logger = logger or logging.getLogger(__name__)
+        # per-tool 熔断器（key=tool_name，LRU 上限 50 个，超出时不再新建，走默认 CircuitBreaker）
+        self._tool_circuit_breakers: dict = {}
+        self._tool_cb_lock = threading.Lock()
+        # 幂等保护的工具集合（从配置读取）
+        self._order_creation_tools: set = set(
+            self.config.get('security', {}).get(
+                'order_creation_tools',
+                ['create_complex_order']   # 兜底：实际存在的下单工具
+            )
+        )
+
+    def _get_tool_circuit_breaker(self, tool_name: str) -> CircuitBreaker:
+        """获取 per-tool 熔断器（最多缓存 50 个）"""
+        with self._tool_cb_lock:
+            if tool_name not in self._tool_circuit_breakers:
+                if len(self._tool_circuit_breakers) >= 50:
+                    # 达到上限，不再新建，返回临时实例
+                    return CircuitBreaker(failure_threshold=5, cooldown_seconds=60.0, logger=self.logger)
+                cb_cfg = self.config.get('orchestrator', {}).get('circuit_breaker', {})
+                self._tool_circuit_breakers[tool_name] = CircuitBreaker(
+                    failure_threshold=cb_cfg.get('tool_failure_threshold', 5),
+                    cooldown_seconds=cb_cfg.get('cooldown_seconds', 60.0),
+                    logger=self.logger,
+                )
+            return self._tool_circuit_breakers[tool_name]
 
     # ================================================================
     # 工具调用主入口
@@ -51,6 +82,20 @@ class ToolCaller:
                 self.logger.warning(f"工具调用被频率限制: {check.reason}")
                 return f"工具执行失败: {check.reason}"
 
+        # per-tool 熔断检查
+        tool_cb = self._get_tool_circuit_breaker(tool_name)
+        if not tool_cb.allow_request():
+            self.logger.warning(f"[ToolCaller] 工具 {tool_name} 熔断中，拒绝调用")
+            return f"工具执行失败: {tool_name} 暂时不可用（熔断中）"
+
+        # 幂等 key 注入（仅对下单类工具）
+        if tool_name in self._order_creation_tools:
+            idem_key = hashlib.sha256(
+                f"{tool_name}:{__import__('json').dumps(parameters, sort_keys=True)}".encode()
+            ).hexdigest()[:16]
+            parameters = {**parameters, 'idempotency_key': idem_key}
+            self.logger.debug(f"[ToolCaller] 注入幂等 key: {idem_key} for {tool_name}")
+
         try:
             # 优先本地工具
             if self.tool_manager:
@@ -58,6 +103,7 @@ class ToolCaller:
                 if tool_info and tool_info.source == "local":
                     self.logger.info(f"调用本地工具: {tool_name}")
                     result = self.tool_manager.call_local_tool(tool_name, parameters)
+                    tool_cb.record_success()
                     return f"工具执行成功: {json.dumps(result, ensure_ascii=False)}"
 
             # MCP 工具
@@ -76,9 +122,11 @@ class ToolCaller:
 
             # 提取 MCP 返回值中的 result 字段（自然语言内容），避免把原始 dict 暴露给用户
             result_text = result.get('result', json.dumps(result, ensure_ascii=False)) if isinstance(result, dict) else str(result)
+            tool_cb.record_success()
             return f"工具执行成功: {result_text}"
         except Exception as e:
             self.logger.error(f"工具调用异常 [{tool_name}]: {e}")
+            tool_cb.record_failure()
             return f"工具执行失败: {str(e)}"
 
     def extract_params_and_call(
@@ -201,21 +249,42 @@ class ToolCaller:
 
     @staticmethod
     def compress_property(prop: dict) -> dict:
-        """压缩单个属性定义"""
+        """压缩单个属性定义，保留 LLM 填参所需的关键字段"""
         if not prop:
             return {}
         compressed = {}
-        for key in ('type', 'description', 'enum', 'items', 'properties', 'required'):
-            if key in prop:
-                val = prop[key]
-                if key == 'properties' and isinstance(val, dict):
-                    compressed[key] = {
-                        k: ToolCaller.compress_property(v) for k, v in val.items()
-                    }
-                elif key == 'items' and isinstance(val, dict):
-                    compressed[key] = ToolCaller.compress_property(val)
-                else:
-                    compressed[key] = val
+
+        # 处理 anyOf（FastMCP 对 Optional[T] 生成 anyOf: [{type: T}, {type: null}]）
+        # 取第一个非 null 的子 schema 作为实际类型描述
+        if 'anyOf' in prop and 'type' not in prop:
+            non_null = next(
+                (s for s in prop['anyOf'] if s.get('type') != 'null'),
+                None
+            )
+            if non_null:
+                compressed.update(ToolCaller.compress_property(non_null))
+            compressed['optional'] = True   # 标记为可选，LLM 可据此判断可不传
+        else:
+            for key in ('type', 'description', 'enum', 'items', 'properties', 'required'):
+                if key in prop:
+                    val = prop[key]
+                    if key == 'properties' and isinstance(val, dict):
+                        compressed[key] = {
+                            k: ToolCaller.compress_property(v) for k, v in val.items()
+                        }
+                    elif key == 'items' and isinstance(val, dict):
+                        compressed[key] = ToolCaller.compress_property(val)
+                    else:
+                        compressed[key] = val
+
+        # 顶层 description 始终保留（anyOf 场景下 description 在顶层）
+        if 'description' in prop and 'description' not in compressed:
+            compressed['description'] = prop['description']
+
+        # 有默认值时保留，帮助 LLM 知道该参数可以省略
+        if 'default' in prop:
+            compressed['default'] = prop['default']
+
         return compressed
 
     # ================================================================
